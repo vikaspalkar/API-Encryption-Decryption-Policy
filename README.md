@@ -11,6 +11,11 @@ The AES key is **fetched at request time** from **AWS Secrets Manager**, cached 
 **Policy name in Anypoint Exchange:** `API Encryption Decryption Policy`
 **Current version:** `1.0.1`
 
+> ⚠️ **Before you publish:** this repo ships with a placeholder Anypoint
+> business-group ID in [Cargo.toml](Cargo.toml). You must replace it with
+> your own org's UUID — see
+> [Section 4 — Installation, step 3](#option-b-build-and-publish-from-source).
+
 ## 2. Architecture
 
 ```
@@ -86,9 +91,37 @@ anypoint-cli-v4 conf password <your-pwd>
 anypoint-cli-v4 conf organization <org-id>
 ```
 
-**3. Update your org's group ID:**
+**3. Update your Anypoint organization / business-group ID:**
 
-Edit [Cargo.toml](Cargo.toml) under `[package.metadata.anypoint]` and replace `group_id` with your business group's UUID.
+> ⚠️ **Required before you can publish.** The repo ships with a placeholder
+> (`group_id = "YOUR-ANYPOINT-BUSINESS-GROUP-UUID"`). You MUST replace it with
+> your own Anypoint business-group UUID or `make publish` / `make release`
+> will fail.
+
+Edit [Cargo.toml](Cargo.toml):
+
+```toml
+[package.metadata.anypoint]
+group_id = "<YOUR-BUSINESS-GROUP-UUID>"                       # ← REPLACE THIS
+definition_asset_id = "api-encryption-decryption-policy"
+implementation_asset_id = "api-encryption-decryption-policy-wasm"
+```
+
+**How to find your business group UUID:**
+
+- **Option A (CLI):**
+  ```bash
+  anypoint-cli-v4 account:business-group:list
+  ```
+  Copy the `Id` column of the business group you want to publish into.
+
+- **Option B (UI):** Anypoint Platform → top‑right org dropdown → **Access
+  Management → Business Groups** → click your group → copy the UUID from the
+  URL bar (the portion after `/accounts/businessGroups/`).
+
+Permissions check: the user you authenticated as in step 2 must have **Exchange
+Contributor** (or higher) in the target business group, otherwise `make release`
+fails with `403 Forbidden`.
 
 **4. Setup, build, publish:**
 
@@ -188,7 +221,7 @@ GET requests skip body transformation entirely and don't require `X-Content-Type
 ```bash
 openssl rand 32 | base64
 # Example output:
-# dHppfVTmYLZk/XmUNDFn6EM3ap4odjntKDyW4F23Yvs=
+# YOUR_BASE64_AES_256_KEY_HERE_44_CHARS_WITH_EQ=
 ```
 
 Must decode to exactly 32 bytes:
@@ -392,4 +425,8 @@ curl -i -X POST "http://<flex-host>/your-endpoint" \
 | WASM binary | `api_encryption_decryption_policy.wasm` |
 | Current version | `1.0.1` |
 
-To publish into your own org, replace `group_id` in [Cargo.toml](Cargo.toml) with your business group's UUID before running `make release`.
+> ⚠️ Before publishing to your own tenant, update `group_id` in
+> [Cargo.toml](Cargo.toml) (`[package.metadata.anypoint]`) from the shipped
+> placeholder `YOUR-ANYPOINT-BUSINESS-GROUP-UUID` to your business group's real
+> UUID. See [Section 4 step 3](#option-b-build-and-publish-from-source) for
+> how to find it.
