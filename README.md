@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-A MuleSoft Flex Gateway custom policy that transparently **encrypts and decrypts HTTP request and response bodies** using **AES‑256‑CBC**. It sits as an inbound policy on the Flex Gateway, in the data path of every API call to the protected API instance, and transforms the body on either leg (request → upstream, upstream → client) independently.
+A MuleSoft Omni(Flex) Gateway custom policy that transparently **encrypts and decrypts HTTP request and response bodies** using **AES‑256‑CBC**. It sits as an inbound policy on the Omni(Flex) Gateway, in the data path of every API call to the protected API instance, and transforms the body on either leg (request → upstream, upstream → client) independently.
 
 The AES key is **fetched at request time** from **AWS Secrets Manager**, cached locally in Flex memory for a configurable TTL, and keyed per client via the `Source` request header — so the same policy instance can serve many clients with isolated keys.
 
@@ -15,7 +15,7 @@ The AES key is **fetched at request time** from **AWS Secrets Manager**, cached 
 
 ```
 ┌──────────┐         ┌─────────────────────────────────────────────┐         ┌──────────────┐
-│          │         │              Flex Gateway                    │         │              │
+│          │         │          Omni(Flex) Gateway                 │         │              │
 │  Client  │──POST──▶│                                              │──POST──▶│   Upstream   │
 │          │         │  ┌──────────┐  ┌────────────────────────┐   │         │   Backend    │
 │          │◀────────│  │  Auth    │→ │  API Encryption        │   │◀────────│              │
@@ -45,7 +45,7 @@ Each can be `Encrypt`, `Decrypt`, or `Plain`. Any combination of the nine is val
 
 ## 3. Prerequisites
 
-- Flex Gateway / Omni Gateway running the PDK 1.10.0 runtime (or compatible — tested on Omni Gateway 1.14.x)
+- Omni(Flex) Gateway running the PDK 1.10.0 runtime (or compatible — tested on Omni Gateway 1.14.x)
 - Rust toolchain **1.83.0+** with the `wasm32-wasip1` target
 - Anypoint CLI v4 with the PDK plugin (`anypoint-pdk-plugin`)
 - Anypoint Platform account with Exchange publish permissions

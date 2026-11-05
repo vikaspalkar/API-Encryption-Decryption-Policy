@@ -3,7 +3,7 @@ name = "api_encryption_decryption_policy"
 version = "1.0.1"
 rust-version = "1.83.0"
 edition = "2021"
-description = "AES-256-CBC encrypt/decrypt policy for Flex Gateway, backed by AWS Secrets Manager"
+description = "AES-256-CBC encrypt/decrypt policy for Omni(Flex) Gateway, backed by AWS Secrets Manager"
 
 [package.metadata.anypoint]
 group_id = "37289ac4-fbe0-43a3-a3e3-7846cb0153e2"

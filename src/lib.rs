@@ -1,4 +1,4 @@
-// AES-256-CBC Encrypt/Decrypt policy for Flex Gateway.
+// AES-256-CBC Encrypt/Decrypt policy for Omni(Flex) Gateway.
 //
 // Fetches a per-`Source` AES-256 key from AWS Secrets Manager (named
 // `aeskeys/<Source>`), caches it in Flex memory for `cacheConfig.ttl`
