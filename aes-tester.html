@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>API Encryption Decryption Policy — Tester</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #1a1d24;
+    --border: #2a2f3a;
+    --text: #e6e8ec;
+    --muted: #8a93a1;
+    --accent: #4ea8ff;
+    --error: #ff6b6b;
+    --success: #4bd37b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px;
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  h1 { margin: 0 0 4px 0; font-size: 20px; font-weight: 600; }
+  .sub { color: var(--muted); margin-bottom: 24px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .row { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .panel h2 { margin: 0 0 12px 0; font-size: 15px; font-weight: 600; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 4px; }
+  input, textarea, select {
+    width: 100%;
+    background: #0b0d12;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 8px 10px;
+    border-radius: 6px;
+    font: 13px/1.4 ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  textarea { resize: vertical; min-height: 80px; }
+  textarea.big { min-height: 160px; }
+  button {
+    background: var(--accent); color: #000; border: none;
+    padding: 8px 14px; border-radius: 6px; font-weight: 600;
+    cursor: pointer; margin-right: 6px; margin-top: 10px;
+  }
+  button.secondary { background: #2a2f3a; color: var(--text); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .status { font-size: 12px; margin-top: 8px; min-height: 18px; }
+  .status.err { color: var(--error); }
+  .status.ok { color: var(--success); }
+  .status.info { color: var(--muted); }
+  pre { background: #0b0d12; padding: 10px; border-radius: 6px;
+        max-height: 240px; overflow: auto; margin: 6px 0; font-size: 12px;
+        white-space: pre-wrap; word-break: break-all; }
+  code { color: var(--accent); }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+</style>
+</head>
+<body>
+
+<h1>API Encryption Decryption Policy — Tester</h1>
+<div class="sub">
+  Encrypt / decrypt JSON payloads locally in the browser, using the same key
+  format the Flex Gateway policy expects (base64 of IV ‖ ciphertext).
+  Policy version: 1.0.1.
+</div>
+
+<div class="panel">
+  <h2>Key</h2>
+  <label>Base64 AES-256 key (same value stored in AWS Secrets Manager under <code>aeskeys/&lt;Source&gt;</code>)</label>
+  <input id="keyB64" type="text" placeholder="e.g. dHppfVTmYLZk/XmUNDFn6EM3ap4odjntKDyW4F23Yvs=" />
+  <div class="hint">
+    Must decode to exactly 32 bytes. Generate on Mac:
+    <code>openssl rand 32 | base64</code>
+  </div>
+  <button onclick="generateKey()" class="secondary">Generate New Key</button>
+  <div id="keyStatus" class="status info"></div>
+</div>
+
+<div class="row">
+  <!-- ENCRYPT panel -->
+  <div class="panel">
+    <h2>Encrypt</h2>
+    <label>Plaintext JSON (what the client would send)</label>
+    <textarea id="plainIn" class="big">{"amount": 1000, "currency": "INR"}</textarea>
+    <button onclick="doEncrypt()">Encrypt →</button>
+    <div id="encStatus" class="status info"></div>
+    <label>Wire body (base64 of IV ‖ ciphertext)</label>
+    <textarea id="cipherOut" class="big" readonly></textarea>
+    <button onclick="copy('cipherOut')" class="secondary">Copy</button>
+  </div>
+
+  <!-- DECRYPT panel -->
+  <div class="panel">
+    <h2>Decrypt</h2>
+    <label>Wire body (base64 of IV ‖ ciphertext — paste the gateway's response here)</label>
+    <textarea id="cipherIn" class="big"></textarea>
+    <button onclick="doDecrypt()">← Decrypt</button>
+    <div id="decStatus" class="status info"></div>
+    <label>Plaintext JSON</label>
+    <textarea id="plainOut" class="big" readonly></textarea>
+    <button onclick="copy('plainOut')" class="secondary">Copy</button>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>cURL command (to call Flex Gateway)</h2>
+  <label>Flex Gateway URL (e.g. <code>http://localhost:8081/your-endpoint</code>)</label>
+  <input id="url" type="text" value="http://localhost:8081/anything" />
+  <label>Source header value (which <code>aeskeys/&lt;Source&gt;</code> secret to use)</label>
+  <input id="source" type="text" value="partnerA" />
+  <label>HTTP method</label>
+  <select id="method">
+    <option>POST</option>
+    <option>PUT</option>
+    <option>PATCH</option>
+  </select>
+  <button onclick="buildCurl()">Build cURL →</button>
+  <pre id="curlOut">(click "Build cURL" after encrypting a payload)</pre>
+  <button onclick="copy('curlOut')" class="secondary">Copy</button>
+  <div class="hint">
+    Only three headers are required by the policy: <code>Content-Type</code>,
+    <code>X-Content-Type</code>, and <code>Source</code>.
+  </div>
+</div>
+
+<script>
+// ---------- key handling ---------------------------------------------------
+
+function b64decode(b64) {
+  const bin = atob(b64.replace(/\s+/g, ''));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+function b64encode(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+
+async function loadKey() {
+  const raw = document.getElementById('keyB64').value.trim();
+  if (!raw) throw new Error('No key provided');
+  const bytes = b64decode(raw);
+  if (bytes.length !== 32) {
+    throw new Error(`Key must be 32 bytes after base64 decode (got ${bytes.length})`);
+  }
+  return await crypto.subtle.importKey(
+    'raw', bytes, { name: 'AES-CBC' }, false, ['encrypt', 'decrypt']
+  );
+}
+
+async function generateKey() {
+  const raw = crypto.getRandomValues(new Uint8Array(32));
+  const b64 = b64encode(raw);
+  document.getElementById('keyB64').value = b64;
+  setStatus('keyStatus', 'ok',
+    `Generated new 32-byte key. Store this exact string in AWS Secrets Manager under aeskeys/<Source>.`);
+}
+
+// ---------- encrypt --------------------------------------------------------
+
+async function doEncrypt() {
+  try {
+    const key = await loadKey();
+    const plaintext = document.getElementById('plainIn').value;
+    if (!plaintext) throw new Error('No plaintext to encrypt');
+
+    const iv = crypto.getRandomValues(new Uint8Array(16));
+    const ciphertext = new Uint8Array(await crypto.subtle.encrypt(
+      { name: 'AES-CBC', iv }, key, new TextEncoder().encode(plaintext)
+    ));
+
+    const wire = new Uint8Array(iv.length + ciphertext.length);
+    wire.set(iv, 0);
+    wire.set(ciphertext, iv.length);
+
+    document.getElementById('cipherOut').value = b64encode(wire);
+    setStatus('encStatus', 'ok',
+      `Encrypted — IV (16 bytes) + ciphertext (${ciphertext.length} bytes) → ${wire.length} bytes total`);
+    setStatus('keyStatus', 'info', 'Key loaded OK.');
+  } catch (e) {
+    setStatus('encStatus', 'err', `Encrypt failed: ${e.message}`);
+  }
+}
+
+// ---------- decrypt --------------------------------------------------------
+
+async function doDecrypt() {
+  try {
+    const key = await loadKey();
+    const wireB64 = document.getElementById('cipherIn').value.trim();
+    if (!wireB64) throw new Error('No wire body to decrypt');
+
+    const wire = b64decode(wireB64);
+    if (wire.length < 17) throw new Error('Wire body too short (expected IV + ciphertext)');
+
+    const iv = wire.slice(0, 16);
+    const ciphertext = wire.slice(16);
+
+    const plainBytes = await crypto.subtle.decrypt(
+      { name: 'AES-CBC', iv }, key, ciphertext
+    );
+    const plaintext = new TextDecoder().decode(plainBytes);
+    document.getElementById('plainOut').value = plaintext;
+
+    // Pretty-print if it's JSON
+    try {
+      const pretty = JSON.stringify(JSON.parse(plaintext), null, 2);
+      document.getElementById('plainOut').value = pretty;
+    } catch {}
+
+    setStatus('decStatus', 'ok',
+      `Decrypted ${ciphertext.length} ciphertext bytes → ${plainBytes.byteLength} plaintext bytes`);
+    setStatus('keyStatus', 'info', 'Key loaded OK.');
+  } catch (e) {
+    setStatus('decStatus', 'err',
+      `Decrypt failed: ${e.message}. Common causes: wrong key, truncated wire body, or wire body isn't base64(IV ‖ ciphertext).`);
+  }
+}
+
+// ---------- curl builder ---------------------------------------------------
+
+function buildCurl() {
+  const wire = document.getElementById('cipherOut').value.trim();
+  if (!wire) {
+    document.getElementById('curlOut').innerText =
+      '(encrypt a payload first — the cURL command uses the result)';
+    return;
+  }
+  const url = document.getElementById('url').value;
+  const method = document.getElementById('method').value;
+  const source = document.getElementById('source').value;
+
+  // Try to detect the real content type from the plaintext input
+  let xContentType = 'application/json';
+  try {
+    JSON.parse(document.getElementById('plainIn').value);
+  } catch {
+    xContentType = 'text/plain';
+  }
+
+  const cmd = `curl -i -X ${method} "${url}" \\
+  -H "Content-Type: application/octet-stream" \\
+  -H "X-Content-Type: ${xContentType}" \\
+  -H "Source: ${source}" \\
+  --data-binary "${wire}"`;
+
+  document.getElementById('curlOut').innerText = cmd;
+}
+
+// ---------- utility --------------------------------------------------------
+
+function setStatus(id, cls, msg) {
+  const el = document.getElementById(id);
+  el.className = `status ${cls}`;
+  el.textContent = msg;
+}
+
+function copy(id) {
+  const el = document.getElementById(id);
+  const txt = el.value ?? el.innerText;
+  navigator.clipboard.writeText(txt).then(() => {
+    const old = event.target.innerText;
+    event.target.innerText = 'Copied ✓';
+    setTimeout(() => { event.target.innerText = old; }, 1200);
+  });
+}
+
+window.addEventListener('load', () => {
+  setStatus('keyStatus', 'info',
+    'Paste the base64 key you stored in AWS Secrets Manager, or click "Generate New Key" for a fresh one.');
+});
+</script>
+</body>
+</html>

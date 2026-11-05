@@ -1,0 +1,84 @@
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: Extension
+metadata:
+  labels:
+    title: API Encryption Decryption Policy
+    description: This policy is used to encrypt or decrypt API request and response body with AES
+    category: Custom
+    metadata/interfaceScope: api,resource
+spec:
+  extends:
+    - name: extension-definition
+      namespace: default
+  properties:
+    requestMode:
+       type: string
+       title: On Request
+       description: What to do with the request body — Encrypt, Decrypt, or Plain (pass-through)
+       enum:
+         - Encrypt
+         - Decrypt
+         - Plain
+    responseMode:
+       type: string
+       title: On Response
+       description: What to do with the response body — Encrypt, Decrypt, or Plain (pass-through)
+       enum:
+         - Encrypt
+         - Decrypt
+         - Plain
+    SuccessStatusCode:
+       type: string
+       title: Encrypt extra status codes (comma-separated)
+       description: Only used when On Response = Encrypt. 200,201,202,204 are always encrypted; list additional codes here (e.g. "207, 418").
+       default: ""
+    SuccessStatusCodeDecrypt:
+       type: string
+       title: Decrypt extra status codes (comma-separated)
+       description: Only used when On Response = Decrypt. 200,201,202,204 are always decrypted; list additional codes here.
+       default: ""
+
+    # --- AWS Secrets Manager --------------------------------------------------
+    awsAccessKey:
+       type: string
+       title: AWS Access Key
+       description: AWS IAM access key ID with secretsmanager:GetSecretValue
+       default: $AwsAccessKey
+    awsAccessSecret:
+       type: string
+       title: AWS Access Secret Key
+       description: AWS IAM secret access key
+       default: $AwsAccessSecretKey
+    awsRegion:
+       type: string
+       title: AWS Region
+       description: AWS region, e.g. ap-south-1
+       default: $AwsRegion
+    awsService:
+       type: string
+       format: service
+       title: AWS Secrets Manager Service URL
+       description: Full URL, e.g. https://secretsmanager.ap-south-1.amazonaws.com
+       default: $AwsSecretManagerServiceUrl
+
+    cacheConfig:
+       type: object
+       title: Cache Configuration
+       description: In-memory cache of fetched AES keys per Source header value
+       properties:
+         ttl:
+           type: integer
+           default: 86400
+           minimum: 1
+           title: Time to live (seconds)
+       required:
+          - ttl
+  required:
+    - cacheConfig
+    - requestMode
+    - responseMode
+    - awsAccessKey
+    - awsAccessSecret
+    - awsRegion
+    - awsService
