@@ -129,10 +129,10 @@ anypoint-cli-v4 conf organization <org-id>
 
 **3. Update your Anypoint organization / business-group ID:**
 
-> ⚠️ **Required before you can publish.** The repo ships with a placeholder
-> (`group_id = "YOUR-ANYPOINT-BUSINESS-GROUP-UUID"`). You MUST replace it with
-> your own Anypoint business-group UUID or `make publish` / `make release`
-> will fail.
+> ⚠️ **Required before you can publish.** The repo ships with the nil
+> placeholder UUID `00000000-0000-0000-0000-000000000000`. `make build` and
+> `make test` work with it, but `make publish` / `make release` will fail
+> until you replace it with your own Anypoint business-group UUID.
 
 Edit [Cargo.toml](Cargo.toml):
 
@@ -476,6 +476,7 @@ If you need temporary v1 interop (e.g. a slow client rollout), the clean path is
 
 > ⚠️ Before publishing to your own tenant, update `group_id` in
 > [Cargo.toml](Cargo.toml) (`[package.metadata.anypoint]`) from the shipped
-> placeholder `YOUR-ANYPOINT-BUSINESS-GROUP-UUID` to your business group's real
-> UUID. See [Section 4 step 3](#option-b-build-and-publish-from-source) for
-> how to find it.
+> nil placeholder (`00000000-0000-0000-0000-000000000000`) to your business
+> group's real UUID. See
+> [Section 4 step 3](#option-b-build-and-publish-from-source) for how to
+> find it.
