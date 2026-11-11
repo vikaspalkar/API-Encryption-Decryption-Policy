@@ -9,7 +9,7 @@ The AES key is **fetched at request time** from **AWS Secrets Manager**, cached 
 **Why:** Enterprises that terminate TLS at the gateway often still need the body to be at‑rest‑encrypted on the client side, on the upstream side, or both — for compliance (RBI, PCI‑DSS, HIPAA, DPDPA), for cross‑region transport, or when integrating with legacy systems that already speak AES. Doing this at the gateway keeps the client and backend simple: neither has to know the other is encrypting.
 
 **Policy name in Anypoint Exchange:** `API Encryption Decryption Policy`
-**Current version:** `1.0.1`
+**Current version:** `1.0.2`
 
 > ⚠️ **Before you publish:** this repo ships with a placeholder Anypoint
 > business-group ID in [Cargo.toml](Cargo.toml). You must replace it with
@@ -46,7 +46,43 @@ The AES key is **fetched at request time** from **AWS Secrets Manager**, cached 
 
 Each can be `Encrypt`, `Decrypt`, or `Plain`. Any combination of the nine is valid; the common ones are documented in [Section 7](#7-mode-combinations).
 
-**Wire format for an encrypted body:** `base64( IV (16 bytes) ‖ ciphertext )`, PKCS#7 padded. The original `Content-Type` is preserved in the `X-Content-Type` header so the other side can parse the plaintext after decrypting.
+**Wire format for an encrypted body (v2, since 1.0.2):**
+
+```
+base64(
+  magic      (2)  = 0x4B 0x41          // "KA"
+  version    (1)  = 0x02
+  iv         (16) = CSPRNG per request
+  ciphertext (n)  = AES-256-CBC, PKCS#7 padded
+  mac        (32) = HMAC-SHA256(mac_key, magic ‖ version ‖ iv ‖ ciphertext)
+)
+```
+
+The MAC covers every byte before it including the version byte, so an attacker cannot downgrade a v2 envelope or flip ciphertext bits unnoticed. The MAC key is derived from the stored AES key via HKDF-SHA256 (label `"api-encryption-decryption-policy/v2/mac-key"`), so operators still manage a single 32-byte secret. v1 envelopes are **rejected** — see [Section 13 — Compatibility](#13-compatibility) for the migration note.
+
+The original `Content-Type` is preserved in the `X-Content-Type` header so the other side can parse the plaintext after decrypting.
+
+**Safety rails (since 1.0.2):**
+
+| Guard | Behaviour |
+|---|---|
+| **Max body** | `768 KiB` per body. Larger bodies → HTTP `413 Payload Too Large`. |
+| **Content-Encoding** | Only `identity` is transformed. `gzip`, `br`, `deflate`, etc. → HTTP `415 Unsupported Media Type`. |
+| **Content-Type streaming** | `text/event-stream`, `application/grpc`, `application/grpc+proto` → HTTP `415`. |
+| **Source header** | ASCII alphanumeric + `.` `_` `-`, max 128 chars, non-empty → otherwise HTTP `400`. |
+| **Mode / TTL** | Unknown `requestMode`/`responseMode` or non-positive `cacheConfig.ttl` fails the policy at config load, not at request time. |
+
+### Error-to-HTTP-status table
+
+| Condition                                    | Status | Body                                              |
+|----------------------------------------------|--------|---------------------------------------------------|
+| Missing / invalid `Source` header            | 400    | `{"error":"Missing or invalid  Source"}`         |
+| MAC mismatch / bad magic / wrong version     | 400    | `{"error":"Decryption failed"}`                   |
+| Secret not found in AWS Secrets Manager      | 400    | `{"error":"Missing or invalid  Source"}`         |
+| Body over `768 KiB`                          | 413    | `{"error":"Payload too large"}`                   |
+| `Content-Encoding != identity` / streaming CT | 415    | `{"error":"Unsupported media type"}`              |
+| AWS IAM / signing misconfiguration           | 500    | `{"error":"AWS Secrets Manager configuration error"}` |
+| AWS throttled or transient outage            | 503    | `{"error":"Secret backend temporarily unavailable"}` |
 
 ## 3. Prerequisites
 
@@ -142,7 +178,7 @@ After `make release`, the policy appears in API Manager under **Custom** policie
 |--------|-------------|
 | `make setup` | Install cargo-anypoint and fetch dependencies |
 | `make build` | Compile WASM + generate the definition + implementation YAMLs |
-| `make test` | Run unit tests |
+| `make test` | Run Rust unit tests (45 tests covering codec, helpers, AWS classifier) + Python redactor regression suite |
 | `make publish` | Publish a development version (`-dev` suffix + timestamp) to Exchange |
 | `make release` | Publish a release version to Exchange |
 | `make show-policy-ref-name` | Print the `policyRef.name` to use in `api.yaml` |
@@ -369,12 +405,25 @@ curl -i -X POST "http://<flex-host>/your-endpoint" \
 | Scenario | Supported | Notes |
 |----------|-----------|-------|
 | JSON request/response bodies | Yes | Full support |
-| Binary request/response bodies | Yes | Policy is content‑type agnostic — any bytes can be AES‑encrypted |
+| Binary request/response bodies | Yes | v2 codec round-trips arbitrary bytes exactly; no UTF-8 coercion |
 | Multipart/form‑data | Partial | The whole body is encrypted/decrypted as a blob; multipart structure is not preserved across the hop |
-| Streaming responses (SSE, chunked) | No | The policy buffers the full body before transforming it |
-| Very large bodies (> 1 MB) | Partial | Works, but memory and latency scale with body size |
+| Streaming responses (SSE, chunked) | No | Rejected with HTTP 415 — SSE/gRPC can't be buffered |
+| Compressed bodies (gzip/br/deflate) | No | Rejected with HTTP 415 — set `Content-Encoding: identity` upstream |
+| Body larger than 768 KiB | No | Rejected with HTTP 413 |
 | GET requests | Yes | Body transformation is skipped on GET; the response leg still runs |
 | WebSocket upgrades | No | PDK WebSocket support is separate; this policy only touches HTTP |
+
+### Migration from v1 (< 1.0.2) envelopes
+
+Version 1.0.2 is a **hard cut** from the v1 wire format (`base64(IV ‖ ciphertext)`, no MAC). v1 envelopes sent to a 1.0.2 gateway are rejected with HTTP 400 "Decryption failed" because they don't start with the v2 magic bytes `0x4B 0x41`. There is no dual-read path.
+
+To migrate:
+
+1. **Deploy 1.0.2 to all gateways simultaneously** or front them with a brief maintenance window. Running mixed 1.0.1 / 1.0.2 gateways against the same clients will cause client-side decrypt failures for the half still producing v1.
+2. **Re-generate test fixtures** on the client side using the new `aes-tester.html` (also shipped in this release). The HTML tester produces v2 envelopes matching the server.
+3. **Update any client SDK** that builds the envelope by hand. The v2 recipe is in [Section 2 — Wire format](#2-architecture) above; a reference JavaScript implementation is in `aes-tester.html`.
+
+If you need temporary v1 interop (e.g. a slow client rollout), the clean path is to deploy a second policy instance pinned at 1.0.1 and route legacy clients through it — not to downgrade 1.0.2 to accept v1.
 
 ## 14. Troubleshooting
 
@@ -423,7 +472,7 @@ curl -i -X POST "http://<flex-host>/your-endpoint" \
 | Implementation assetId | `api-encryption-decryption-policy-wasm` |
 | Flex `policyRef.name` | `api-encryption-decryption-policy-v1-0-impl` |
 | WASM binary | `api_encryption_decryption_policy.wasm` |
-| Current version | `1.0.1` |
+| Current version | `1.0.2` |
 
 > ⚠️ Before publishing to your own tenant, update `group_id` in
 > [Cargo.toml](Cargo.toml) (`[package.metadata.anypoint]`) from the shipped

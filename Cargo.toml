@@ -1,6 +1,6 @@
 [package]
 name = "api_encryption_decryption_policy"
-version = "1.0.1"
+version = "1.0.2"
 rust-version = "1.83.0"
 edition = "2021"
 description = "AES-256-CBC encrypt/decrypt policy for Omni(Flex) Gateway, backed by AWS Secrets Manager"

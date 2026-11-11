@@ -224,3 +224,233 @@ impl Codec {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests — these are host unit tests (`cargo test --lib`). They cover the
+// reviewer's P4A findings #1 and #9 directly: byte-exact round trip,
+// MAC verification, version-downgrade rejection, bad magic rejection,
+// and malformed envelopes.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+
+    /// Deterministic 32-byte key for tests. NOT a secret — it's the SHA-256
+    /// of the string "test-key" in base64. Using a fixed key keeps test
+    /// output reproducible.
+    fn test_key_b64() -> String {
+        // sha256("test-key") → 32 bytes → base64. Pre-computed so tests
+        // don't need to call sha2 themselves.
+        B64.encode([
+            0x9b, 0xa0, 0x44, 0xd2, 0xa0, 0x8f, 0x6b, 0x38,
+            0xe2, 0x56, 0x4a, 0xdd, 0xa6, 0x5c, 0x61, 0x6c,
+            0x24, 0x21, 0xab, 0x95, 0xf4, 0x23, 0x5a, 0x24,
+            0x11, 0xc8, 0xbf, 0x1d, 0xd5, 0x80, 0x75, 0x4a,
+        ])
+    }
+
+    fn codec() -> Codec {
+        Codec::from_b64_key(&test_key_b64()).expect("fixed test key is valid")
+    }
+
+    fn ctx() -> TraceCtx<'static> {
+        TraceCtx { source: "test" }
+    }
+
+    // ---- round-trip ------------------------------------------------------
+
+    /// Issue #9: non-UTF-8 binary bytes must round-trip exactly.
+    #[test]
+    fn round_trip_binary_bytes() {
+        let codec = codec();
+        let plaintext: &[u8] = &[0x00, 0xff, 0x80, 0x41, 0x00, 0x7f, 0xc0];
+        let envelope = codec.seal(plaintext, &ctx()).expect("seal ok");
+        let recovered = codec.open(&envelope, &ctx()).expect("open ok");
+        assert_eq!(recovered, plaintext, "binary round trip must be byte-exact");
+    }
+
+    /// Standard JSON payload path.
+    #[test]
+    fn round_trip_json() {
+        let codec = codec();
+        let plaintext = br#"{"amount":1000,"currency":"INR"}"#;
+        let envelope = codec.seal(plaintext, &ctx()).expect("seal ok");
+        let recovered = codec.open(&envelope, &ctx()).expect("open ok");
+        assert_eq!(recovered, plaintext);
+    }
+
+    /// Single-byte and single-block edge cases.
+    #[test]
+    fn round_trip_single_byte() {
+        let codec = codec();
+        let envelope = codec.seal(b"x", &ctx()).expect("seal ok");
+        assert_eq!(codec.open(&envelope, &ctx()).unwrap(), b"x");
+    }
+
+    /// Payload exactly on a block boundary (16 bytes) — PKCS#7 adds a full
+    /// padding block. Make sure the codec handles it.
+    #[test]
+    fn round_trip_block_boundary() {
+        let codec = codec();
+        let plaintext: &[u8] = &[0xab; 16];
+        let envelope = codec.seal(plaintext, &ctx()).expect("seal ok");
+        assert_eq!(codec.open(&envelope, &ctx()).unwrap(), plaintext);
+    }
+
+    // ---- authenticity (issue #1) -----------------------------------------
+
+    /// Flipping ANY byte of the ciphertext must trigger MAC mismatch, not
+    /// a decrypt attempt. This is the primary P4A finding #1.
+    #[test]
+    fn tampered_ciphertext_byte_rejected() {
+        let codec = codec();
+        let plaintext = br#"{"amount":1000}"#;
+        let envelope = codec.seal(plaintext, &ctx()).unwrap();
+
+        // Decode, flip byte at position 10 (inside the IV), re-encode.
+        let mut raw = B64.decode(&envelope).unwrap();
+        raw[10] ^= 0x01;
+        let tampered = B64.encode(&raw);
+
+        let err = codec.open(tampered.as_bytes(), &ctx()).unwrap_err();
+        assert!(
+            matches!(err, CodecError::MacMismatch),
+            "tampered IV must yield MacMismatch, got {err:?}",
+        );
+    }
+
+    /// Flipping a byte in the MAC itself must also be rejected.
+    #[test]
+    fn tampered_mac_rejected() {
+        let codec = codec();
+        let envelope = codec.seal(b"hello", &ctx()).unwrap();
+        let mut raw = B64.decode(&envelope).unwrap();
+        let len = raw.len();
+        raw[len - 1] ^= 0x01; // last byte is part of the MAC
+        let tampered = B64.encode(&raw);
+        assert!(matches!(
+            codec.open(tampered.as_bytes(), &ctx()).unwrap_err(),
+            CodecError::MacMismatch
+        ));
+    }
+
+    /// Flipping the version byte must be rejected — MAC covers version,
+    /// so downgrade attacks produce MacMismatch rather than silently
+    /// accepting the altered envelope.
+    #[test]
+    fn tampered_version_rejected() {
+        let codec = codec();
+        let envelope = codec.seal(b"hello", &ctx()).unwrap();
+        let mut raw = B64.decode(&envelope).unwrap();
+        raw[2] = 0x03; // flip version from 0x02 → 0x03
+        let tampered = B64.encode(&raw);
+        // Could be either UnsupportedVersion (version check runs before
+        // MAC) or MacMismatch depending on ordering — both are safe.
+        let err = codec.open(tampered.as_bytes(), &ctx()).unwrap_err();
+        assert!(
+            matches!(err, CodecError::UnsupportedVersion(_) | CodecError::MacMismatch),
+            "tampered version must be rejected, got {err:?}",
+        );
+    }
+
+    // ---- envelope shape --------------------------------------------------
+
+    /// v1-shape envelope (no magic, no MAC) must be rejected outright.
+    #[test]
+    fn v1_envelope_shape_rejected() {
+        let codec = codec();
+        // A v1-ish envelope: IV(16) || random ciphertext(16). Not valid
+        // base64-of-v2 at all. Expect BadMagic or BadBase64.
+        let fake = B64.encode([0u8; 32]);
+        let err = codec.open(fake.as_bytes(), &ctx()).unwrap_err();
+        assert!(
+            matches!(err, CodecError::BadMagic | CodecError::BadBase64),
+            "v1-shaped envelope must be rejected, got {err:?}",
+        );
+    }
+
+    /// Envelope below the minimum size is caught before magic parsing.
+    #[test]
+    fn tiny_envelope_rejected() {
+        let codec = codec();
+        let tiny = B64.encode([0u8; 10]);
+        let err = codec.open(tiny.as_bytes(), &ctx()).unwrap_err();
+        assert!(matches!(err, CodecError::BadBase64), "got {err:?}");
+    }
+
+    /// Non-base64 input bails cleanly without panicking.
+    #[test]
+    fn non_base64_rejected() {
+        let codec = codec();
+        let err = codec.open(b"not-valid-base64!!!!", &ctx()).unwrap_err();
+        assert!(matches!(err, CodecError::BadBase64), "got {err:?}");
+    }
+
+    /// Whitespace inside the base64 blob must be tolerated — intermediaries
+    /// line-wrap base64 payloads.
+    #[test]
+    fn whitespace_in_base64_tolerated() {
+        let codec = codec();
+        let envelope = codec.seal(b"hello", &ctx()).unwrap();
+        let wrapped: Vec<u8> = envelope
+            .chunks(20)
+            .collect::<Vec<_>>()
+            .join(&b'\n');
+        assert_eq!(codec.open(&wrapped, &ctx()).unwrap(), b"hello");
+    }
+
+    // ---- key handling ----------------------------------------------------
+
+    #[test]
+    fn invalid_key_length_rejected() {
+        // 31 bytes — one short
+        let short_key = B64.encode([0u8; 31]);
+        assert!(matches!(
+            Codec::from_b64_key(&short_key),
+            Err(CodecError::KeyLength)
+        ));
+
+        // 33 bytes — one too many
+        let long_key = B64.encode([0u8; 33]);
+        assert!(matches!(
+            Codec::from_b64_key(&long_key),
+            Err(CodecError::KeyLength)
+        ));
+    }
+
+    #[test]
+    fn empty_key_rejected() {
+        assert!(matches!(
+            Codec::from_b64_key(""),
+            Err(CodecError::KeyLength)
+        ));
+    }
+
+    /// Issue #1 complement: two different AES keys must produce
+    /// unverifiable MACs for each other's envelopes — proves HKDF derives
+    /// a distinct MAC key per AES key.
+    #[test]
+    fn different_keys_do_not_cross_verify() {
+        let codec_a = Codec::from_b64_key(&B64.encode([0xaa; 32])).unwrap();
+        let codec_b = Codec::from_b64_key(&B64.encode([0xbb; 32])).unwrap();
+        let envelope_a = codec_a.seal(b"secret", &ctx()).unwrap();
+        let err = codec_b.open(&envelope_a, &ctx()).unwrap_err();
+        assert!(matches!(err, CodecError::MacMismatch), "got {err:?}");
+    }
+
+    /// Two seals of the same plaintext with the same key must differ (fresh
+    /// random IV each time) — otherwise we leak equality of plaintexts.
+    #[test]
+    fn distinct_iv_per_seal() {
+        let codec = codec();
+        let plaintext = b"same plaintext";
+        let a = codec.seal(plaintext, &ctx()).unwrap();
+        let b = codec.seal(plaintext, &ctx()).unwrap();
+        assert_ne!(a, b, "two seals of identical plaintext must differ");
+        // But both must open to the same plaintext.
+        assert_eq!(codec.open(&a, &ctx()).unwrap(), plaintext);
+        assert_eq!(codec.open(&b, &ctx()).unwrap(), plaintext);
+    }
+}

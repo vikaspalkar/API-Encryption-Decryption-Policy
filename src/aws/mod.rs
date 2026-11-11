@@ -262,3 +262,172 @@ pub async fn fetch_secret_string(
         .map(str::to_owned)
         .ok_or(AwsSecretError::MissingSecretString)
 }
+
+// ---------------------------------------------------------------------------
+// Tests — host unit tests for the pure helpers. The AWS call itself can't be
+// unit-tested here (it needs a real `HttpClient`/`Service` pair), but the
+// signing math and the error-classification logic are pure and worth
+// covering. Classifier tests map directly to reviewer finding #15.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ---- classify_aws_error (issue #15) ---------------------------------
+
+    #[test]
+    fn classifies_resource_not_found_as_caller_error() {
+        let body = json!({ "__type": "ResourceNotFoundException", "Message": "nope" });
+        assert!(matches!(
+            classify_aws_error(400, &body),
+            AwsSecretError::NotFound
+        ));
+    }
+
+    #[test]
+    fn classifies_access_denied_as_misconfig() {
+        for ty in [
+            "AccessDeniedException",
+            "UnrecognizedClientException",
+            "InvalidSignatureException",
+            "ExpiredTokenException",
+            "InvalidClientTokenId",
+        ] {
+            let body = json!({ "__type": ty, "Message": "denied" });
+            let err = classify_aws_error(400, &body);
+            assert!(
+                matches!(err, AwsSecretError::AuthFailed(_)),
+                "{ty} should map to AuthFailed, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_throttling_as_transient() {
+        for ty in [
+            "ThrottlingException",
+            "InternalServiceError",
+            "InternalFailure",
+            "ServiceUnavailable",
+            "SlowDown",
+        ] {
+            let body = json!({ "__type": ty });
+            let err = classify_aws_error(400, &body);
+            assert!(
+                matches!(err, AwsSecretError::Throttled(_)),
+                "{ty} should map to Throttled, got {err:?}"
+            );
+        }
+    }
+
+    /// If AWS returned a 5xx with no __type, we must still treat it as
+    /// transient — never as a caller error.
+    #[test]
+    fn classifies_bare_5xx_as_throttled() {
+        let body = json!({});
+        let err = classify_aws_error(500, &body);
+        assert!(
+            matches!(err, AwsSecretError::Throttled(_)),
+            "bare HTTP 500 must map to Throttled, got {err:?}"
+        );
+        let err = classify_aws_error(503, &body);
+        assert!(
+            matches!(err, AwsSecretError::Throttled(_)),
+            "bare HTTP 503 must map to Throttled, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn classifies_bare_403_as_auth_failed() {
+        let body = json!({});
+        let err = classify_aws_error(403, &body);
+        assert!(
+            matches!(err, AwsSecretError::AuthFailed(_)),
+            "bare HTTP 403 must map to AuthFailed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn classifies_unknown_type_as_other() {
+        let body = json!({ "__type": "SomeNewFutureException", "Message": "?" });
+        assert!(matches!(
+            classify_aws_error(400, &body),
+            AwsSecretError::Other(_)
+        ));
+    }
+
+    #[test]
+    fn classifies_bare_400_as_other() {
+        // 400 with no __type — likely a caller / validation issue.
+        let body = json!({ "Message": "malformed" });
+        assert!(matches!(
+            classify_aws_error(400, &body),
+            AwsSecretError::Other(_)
+        ));
+    }
+
+    // ---- signing primitives ---------------------------------------------
+
+    /// Sanity: the SigV4 canonical-request / string-to-sign shapes are
+    /// stable (exactly the layout AWS specifies). A regression here would
+    /// break every call, so pin the shape.
+    #[test]
+    fn sigv4_strings_have_expected_layout() {
+        let (canonical, sts, scope) = build_sigv4_strings(
+            "secretsmanager.us-east-1.amazonaws.com",
+            "20260101T000000Z",
+            "20260101",
+            "us-east-1",
+            b"{}",
+        );
+        // Canonical request begins with POST\n/\n\n
+        assert!(canonical.starts_with("POST\n/\n\n"), "canonical starts wrong");
+        // Must contain each header line and the signed-headers list.
+        assert!(canonical.contains("content-type:application/x-amz-json-1.1"));
+        assert!(canonical.contains("host:secretsmanager.us-east-1.amazonaws.com"));
+        assert!(canonical.contains("x-amz-date:20260101T000000Z"));
+        assert!(canonical.contains("x-amz-target:secretsmanager.GetSecretValue"));
+        assert!(canonical.contains("content-type;host;x-amz-date;x-amz-target"));
+        // Scope shape: yyyymmdd/region/service/aws4_request
+        assert_eq!(scope, "20260101/us-east-1/secretsmanager/aws4_request");
+        // StringToSign has 4 lines: algo, amz_date, scope, hash
+        assert_eq!(sts.lines().count(), 4);
+        assert_eq!(sts.lines().next().unwrap(), "AWS4-HMAC-SHA256");
+    }
+
+    /// The signing-key derivation is a fixed HMAC chain. Compare against a
+    /// known-answer test from the AWS docs (the test vector in the SigV4
+    /// examples), verifying our chain matches AWS's exactly.
+    #[test]
+    fn signing_key_matches_aws_test_vector() {
+        // From the AWS SigV4 test suite:
+        //   secret   = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+        //   date     = "20120215"
+        //   region   = "us-east-1"
+        //   service  = "iam"
+        // Expected signing key (hex):
+        //   f4780e2d9f65fa895f9c67b32ce1baf0b0d8a43505a000a1a9e090d414db404d
+        let key = derive_signing_key(
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            "20120215",
+            "us-east-1",
+            "iam",
+        );
+        assert_eq!(
+            hex::encode(&key),
+            "f4780e2d9f65fa895f9c67b32ce1baf0b0d8a43505a000a1a9e090d414db404d",
+            "SigV4 key derivation drifted from the AWS reference",
+        );
+    }
+
+    #[test]
+    fn sha256_hex_is_lowercase_hex() {
+        // sha256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        );
+    }
+}

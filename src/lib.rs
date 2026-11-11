@@ -70,6 +70,7 @@ const UNSUPPORTED_STREAMING_CTS: &[&str] = &[
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
+#[cfg_attr(test, derive(Debug))]
 enum Mode {
     Encrypt,
     Decrypt,
@@ -824,4 +825,222 @@ async fn configure(
 
     launcher.launch(filter).await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests — host unit tests (`cargo test --lib`) covering the pure helpers.
+// Each cluster below maps to specific P4A reviewer findings:
+//   Mode::parse         → #12 (strict mode validation)
+//   source_allowed      → #2  (Source header char-set)
+//   parse_allow_list    → status allow-list parsing
+//   HeadersHandler stub → #8  (Content-Encoding) and #13 (streaming CTs)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    // ---- Mode::parse (issue #12) -----------------------------------------
+
+    #[test]
+    fn mode_parse_accepts_canonical_values() {
+        assert!(matches!(Mode::parse("Encrypt"), Ok(Mode::Encrypt)));
+        assert!(matches!(Mode::parse("Decrypt"), Ok(Mode::Decrypt)));
+        assert!(matches!(Mode::parse("Plain"),   Ok(Mode::Plain)));
+    }
+
+    #[test]
+    fn mode_parse_rejects_unknown_values() {
+        // The entire point of #12 — an unknown value must NOT silently
+        // become Plain (which would disable encryption without notice).
+        assert!(Mode::parse("encrypt").is_err(), "case-sensitive");
+        assert!(Mode::parse("ENCRYPT").is_err());
+        assert!(Mode::parse("Bypass").is_err(), "unknown token");
+        assert!(Mode::parse("").is_err(),       "empty string");
+        assert!(Mode::parse(" Encrypt ").is_err(), "no whitespace trimming");
+    }
+
+    #[test]
+    fn mode_parse_error_includes_offending_value() {
+        let err = Mode::parse("bogus").unwrap_err();
+        assert!(err.contains("bogus"), "error must name the bad value");
+    }
+
+    // ---- source_allowed (issue #2) ---------------------------------------
+
+    #[test]
+    fn source_allowed_accepts_safe_chars() {
+        assert!(source_allowed("partnerA"));
+        assert!(source_allowed("partner-A"));
+        assert!(source_allowed("partner_A"));
+        assert!(source_allowed("partner.A"));
+        assert!(source_allowed("ABC123"));
+        assert!(source_allowed("a"), "single char is fine");
+    }
+
+    #[test]
+    fn source_allowed_rejects_dangerous_chars() {
+        // These are the classes we must reject: slash (path traversal),
+        // quote (JSON injection — even though serde closes that door),
+        // whitespace, control chars, unicode.
+        assert!(!source_allowed(""),            "empty rejected");
+        assert!(!source_allowed("partner/A"),   "slash forbidden");
+        assert!(!source_allowed("partner\\A"),  "backslash forbidden");
+        assert!(!source_allowed("partner\"A"),  "double-quote forbidden");
+        assert!(!source_allowed("partner A"),   "space forbidden");
+        assert!(!source_allowed("partner\nA"),  "newline forbidden");
+        assert!(!source_allowed("partner\x00A"), "null forbidden");
+        assert!(!source_allowed("partnerΩ"),    "non-ASCII forbidden");
+        assert!(!source_allowed("../etc/passwd"), "path traversal");
+    }
+
+    #[test]
+    fn source_allowed_enforces_length_cap() {
+        let ok  = "a".repeat(128);
+        let bad = "a".repeat(129);
+        assert!(source_allowed(&ok),   "128 chars OK");
+        assert!(!source_allowed(&bad), "129 chars rejected");
+    }
+
+    // ---- parse_allow_list ------------------------------------------------
+
+    #[test]
+    fn parse_allow_list_merges_user_and_default() {
+        // Empty user input → just the default list.
+        let got = parse_allow_list("");
+        assert!(got.contains(&"200".to_string()));
+        assert!(got.contains(&"201".to_string()));
+        assert!(got.contains(&"202".to_string()));
+        assert!(got.contains(&"204".to_string()));
+    }
+
+    #[test]
+    fn parse_allow_list_appends_user_codes() {
+        let got = parse_allow_list("418, 299");
+        assert!(got.contains(&"418".to_string()));
+        assert!(got.contains(&"299".to_string()));
+        // defaults still present
+        assert!(got.contains(&"200".to_string()));
+    }
+
+    #[test]
+    fn parse_allow_list_trims_and_drops_empties() {
+        let got = parse_allow_list("  418  ,  ,  ");
+        assert!(got.contains(&"418".to_string()));
+        assert!(!got.contains(&"".to_string()),
+                "empty tokens must be dropped");
+    }
+
+    // ---- HeadersHandler stub (shared by the two tests below) -------------
+
+    /// Minimal stub that satisfies the PDK `HeadersHandler` trait for host
+    /// tests. The policy helpers we test only call `.header(name)` — the
+    /// mutator methods are no-ops.
+    struct StubHeaders {
+        store: RefCell<HashMap<String, String>>,
+    }
+    impl StubHeaders {
+        fn with(pairs: &[(&str, &str)]) -> Self {
+            let mut m = HashMap::new();
+            for (k, v) in pairs {
+                m.insert(k.to_string(), v.to_string());
+            }
+            Self { store: RefCell::new(m) }
+        }
+    }
+    impl HeadersHandler for StubHeaders {
+        fn headers(&self) -> Vec<(String, String)> {
+            self.store.borrow().iter().map(|(k,v)| (k.clone(), v.clone())).collect()
+        }
+        fn header(&self, name: &str) -> Option<String> {
+            // Case-insensitive like real PDK does.
+            self.store.borrow().iter()
+                .find(|(k,_)| k.eq_ignore_ascii_case(name))
+                .map(|(_,v)| v.clone())
+        }
+        fn add_header(&self, _name: &str, _value: &str) {}
+        fn set_header(&self, _name: &str, _value: &str) {}
+        fn set_headers(&self, _headers: Vec<(&str, &str)>) {}
+        fn remove_header(&self, _name: &str) {}
+    }
+
+    // ---- unsupported_encoding (issue #8) ---------------------------------
+
+    #[test]
+    fn encoding_none_means_safe() {
+        let h = StubHeaders::with(&[]);
+        assert_eq!(unsupported_encoding(&h), None);
+    }
+
+    #[test]
+    fn encoding_identity_means_safe() {
+        let h = StubHeaders::with(&[("Content-Encoding", "identity")]);
+        assert_eq!(unsupported_encoding(&h), None);
+
+        // With surrounding whitespace / mixed case
+        let h = StubHeaders::with(&[("Content-Encoding", "  Identity  ")]);
+        assert_eq!(unsupported_encoding(&h), None);
+    }
+
+    #[test]
+    fn encoding_gzip_is_rejected() {
+        let h = StubHeaders::with(&[("Content-Encoding", "gzip")]);
+        assert_eq!(unsupported_encoding(&h), Some("gzip".to_string()));
+    }
+
+    #[test]
+    fn encoding_br_is_rejected() {
+        let h = StubHeaders::with(&[("Content-Encoding", "BR")]);
+        assert_eq!(unsupported_encoding(&h), Some("br".to_string()));
+    }
+
+    #[test]
+    fn encoding_deflate_is_rejected() {
+        let h = StubHeaders::with(&[("Content-Encoding", "deflate")]);
+        assert_eq!(unsupported_encoding(&h), Some("deflate".to_string()));
+    }
+
+    // ---- is_streaming_content_type (issue #13) ---------------------------
+
+    #[test]
+    fn streaming_none_when_no_ct() {
+        let h = StubHeaders::with(&[]);
+        assert_eq!(is_streaming_content_type(&h), None);
+    }
+
+    #[test]
+    fn streaming_none_for_json() {
+        let h = StubHeaders::with(&[("Content-Type", "application/json")]);
+        assert_eq!(is_streaming_content_type(&h), None);
+    }
+
+    #[test]
+    fn streaming_rejects_sse() {
+        let h = StubHeaders::with(&[("Content-Type", "text/event-stream")]);
+        assert_eq!(is_streaming_content_type(&h), Some("text/event-stream".into()));
+    }
+
+    #[test]
+    fn streaming_rejects_grpc() {
+        let h = StubHeaders::with(&[("Content-Type", "application/grpc")]);
+        assert_eq!(is_streaming_content_type(&h), Some("application/grpc".into()));
+
+        let h = StubHeaders::with(&[("Content-Type", "application/grpc+proto")]);
+        assert_eq!(is_streaming_content_type(&h), Some("application/grpc+proto".into()));
+    }
+
+    #[test]
+    fn streaming_ignores_charset_param() {
+        // Content-Type with parameters: only the primary MIME type is compared.
+        let h = StubHeaders::with(&[("Content-Type", "text/event-stream; charset=utf-8")]);
+        assert_eq!(is_streaming_content_type(&h), Some("text/event-stream".into()));
+    }
+
+    #[test]
+    fn streaming_case_insensitive() {
+        let h = StubHeaders::with(&[("Content-Type", "TEXT/EVENT-STREAM")]);
+        assert_eq!(is_streaming_content_type(&h), Some("text/event-stream".into()));
+    }
 }

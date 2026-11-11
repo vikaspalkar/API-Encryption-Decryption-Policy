@@ -47,8 +47,9 @@ build-asset-files: $(DEFINITION_SRC_GCL_PATH)
 	@python3 scripts/redact_generated_config.py src/generated/config.rs
 
 .PHONY: test
-test: ## Run unit tests
-	@cargo test --lib -- --nocapture
+test: ## Run unit tests (Rust + redactor regression suite)
+	@cargo test --lib
+	@python3 -I scripts/test_redact_generated_config.py
 
 .PHONY: publish
 publish: build ## Publish a development version of the policy
