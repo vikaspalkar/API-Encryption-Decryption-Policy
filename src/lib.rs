@@ -18,7 +18,7 @@ use pdk::hl::*;
 use serde::{Deserialize, Serialize};
 
 use crate::aws::{fetch_secret_string, SecretsManagerCreds};
-use crate::codec::{strip_ws, Codec};
+use crate::codec::Codec;
 use crate::generated::config::Config;
 use crate::support::cache::{get as cache_get, put as cache_put, TtlPolicy};
 use crate::support::headers::{mutate as mutate_headers, require as require_header, snapshot as snap_headers, HeaderBag};
@@ -37,8 +37,33 @@ const WATCHED: &[&str] = &[
 ];
 
 const DEFAULT_ALLOWED_STATUS: &str = "200, 201, 202, 204";
-const CACHE_NAME: &str = "policy-cache";
 const CACHE_CAPACITY: usize = 100;
+/// Issue #3 — the PDK shared cache is scoped by its string name across
+/// every policy instance in a gateway cache-sharing domain. Using a
+/// static "policy-cache" meant two instances of this policy (same WASM,
+/// different AWS accounts/regions) would hit each other's AES keys. We
+/// now build the cache name at runtime from the group_id, AWS region,
+/// and a hash of the access key so each `(authority, region)` pair gets
+/// its own isolated namespace.
+const CACHE_NAME_PREFIX: &str = "api-encryption-decryption-policy";
+
+/// Issue #13 — upper bound on **plaintext** body size we'll attempt to
+/// encrypt or **base64 ciphertext** we'll attempt to decrypt. The
+/// post-encryption wire size is `4 * ceil((16 + 16 * (ceil(n/16) + 1)) / 3)`
+/// which, for n = 768 KiB, is about 1.05 MiB — comfortably below Flex's
+/// default 1 MiB write ceiling with headroom for base64 padding. Operators
+/// who know their gateway runs with a larger buffer can only grow this in
+/// the source today; a future revision could expose it in gcl.yaml.
+const MAX_BODY_BYTES: usize = 768 * 1024;
+
+/// Issue #13 — content types we outright refuse to transform because the
+/// body never arrives as a single buffered unit. Attempting to transform
+/// one would deadlock on end-of-stream.
+const UNSUPPORTED_STREAMING_CTS: &[&str] = &[
+    "text/event-stream",
+    "application/grpc",
+    "application/grpc+proto",
+];
 
 // ---------------------------------------------------------------------------
 // Modes
@@ -165,6 +190,43 @@ fn source_allowed(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
 }
 
+/// Issue #8 — this policy only transforms bodies when their wire bytes
+/// are the plaintext (encrypt leg) or base64 ciphertext (decrypt leg).
+/// Any Content-Encoding other than identity means the wire bytes are
+/// compressed/encoded in some way the policy doesn't understand: we
+/// would end up either base64-ing gzip bytes (encrypt) or trying to
+/// base64-decode gzip bytes (decrypt). Both corrupt the payload.
+///
+/// Returns `None` if the request is safe to transform (no Content-Encoding
+/// header, or an explicit "identity"); `Some(encoding)` if it must be
+/// rejected.
+fn unsupported_encoding(hh: &dyn HeadersHandler) -> Option<String> {
+    match hh.header("Content-Encoding") {
+        None => None,
+        Some(v) => {
+            let normalised = v.trim().to_ascii_lowercase();
+            if normalised.is_empty() || normalised == "identity" {
+                None
+            } else {
+                Some(normalised)
+            }
+        }
+    }
+}
+
+/// Issue #13 — SSE, gRPC, and similar streaming content types never arrive
+/// as a single buffered body. Attempting to buffer-and-transform them
+/// would block the stream forever. Reject at header time.
+fn is_streaming_content_type(hh: &dyn HeadersHandler) -> Option<String> {
+    let ct = hh.header("Content-Type")?;
+    let primary = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    if UNSUPPORTED_STREAMING_CTS.iter().any(|s| *s == primary) {
+        Some(primary)
+    } else {
+        None
+    }
+}
+
 async fn resolve_secret(
     cfg: &Config,
     client: HttpClient,
@@ -195,11 +257,23 @@ async fn resolve_secret(
         cfg.aws_access_secret.clone(),
         cfg.aws_region.clone(),
     );
+    // AWS error → HTTP status mapping (issue #15). Caller-named a bad
+    // secret → 400; our signing/IAM is wrong → 500; AWS is throttled or
+    // down → 503; unknown AWS error → 503 (conservative).
     let fetched = fetch_secret_string(&creds, &secret_name, client, &cfg.aws_service, &ctx)
         .await
         .map_err(|e| {
+            use crate::aws::AwsSecretError::*;
             trace(&ctx, Level::Error, &format!("Fetch Secret (AWS) - Failed: {e}"));
-            error_response(400, "Missing or invalid  Source", &ctx)
+            match e {
+                NotFound => error_response(400, "Missing or invalid  Source", &ctx),
+                AuthFailed(_) | MissingSecretString => {
+                    error_response(500, "AWS Secrets Manager configuration error", &ctx)
+                }
+                Throttled(_) | HttpClient(_) | JsonParse | Other(_) => {
+                    error_response(503, "Secret backend temporarily unavailable", &ctx)
+                }
+            }
         })?;
 
     let _ = cache_put(cache, policy, &secret_name, &fetched);
@@ -213,13 +287,46 @@ async fn resolve_secret(
 mod body {
     use super::*;
 
+    /// Replace the response body with a JSON error.
+    ///
+    /// Issue #10 — honest acknowledgement: PDK's split header/body state
+    /// machine commits response headers (including status and
+    /// Content-Type) **before** this function is called. The body
+    /// handler surface (`BodyHandler`) only exposes `body` and
+    /// `set_body` — there is no supported way to mutate `Content-Type`
+    /// or status from the body stage. To do that properly we would need
+    /// the `enable_stop_iteration` feature (`IntoHeadersBodyState`),
+    /// which this build deliberately avoids.
+    ///
+    /// Given the constraint, the fail-closed contract this policy can
+    /// honour is:
+    ///
+    /// 1. On transform failure, replace the body with a JSON error so
+    ///    the client receives a structured failure signal, never the
+    ///    half-transformed or raw plaintext.
+    /// 2. Operators and clients are told (via README §10) that on
+    ///    failure the response's `Content-Type` may still advertise
+    ///    the originally-planned encoding (e.g. application/octet-stream
+    ///    for encrypt-mode) — they must parse the body as JSON if
+    ///    body starts with `{"errorMessage":`.
+    /// 3. If `set_body` itself is rejected by the host, we log it and
+    ///    leave the response untouched — attempting any further rewrite
+    ///    would just double-fault.
+    ///
+    /// The next revision (tracked in CHANGELOG) adopts
+    /// `enable_stop_iteration` so we can also flip Content-Type and
+    /// strip stale validators at this stage.
     fn write_error_body(h: &dyn BodyHandler, ctx: &TraceCtx<'_>, msg: &str) {
         let payload = serde_json::json!({
             "errorMessage": msg,
             "source":       ctx.source,
         })
         .to_string();
-        let _ = h.set_body(payload.as_bytes());
+        if let Err(e) = h.set_body(payload.as_bytes()) {
+            trace(ctx, Level::Error, &format!(
+                "Fail-closed response: set_body rejected the error body: {e}"
+            ));
+        }
     }
 
     pub async fn encrypt_request(hs: RequestHeadersState, codec: &Codec, headers: &HeaderBag) -> Flow<()> {
@@ -232,10 +339,20 @@ mod body {
             return Flow::Continue(());
         }
 
-        let plaintext = String::from_utf8_lossy(body.as_slice());
-        match codec.seal(&plaintext, &ctx) {
+        // Issue #13: plaintext too large to base64-expand within buffer.
+        if body.len() > MAX_BODY_BYTES {
+            trace(&ctx, Level::Error, &format!(
+                "Encrypt request body too large: {} bytes > {} byte limit",
+                body.len(), MAX_BODY_BYTES
+            ));
+            return error_response(413, "Request body exceeds policy maximum", &ctx);
+        }
+
+        // Byte-oriented path (issue #9): we hand raw body bytes to the
+        // codec. No UTF-8 coercion in either direction.
+        match codec.seal(body.as_slice(), &ctx) {
             Ok(enc) => {
-                if let Err(e) = bh.set_body(enc.as_bytes()) {
+                if let Err(e) = bh.set_body(&enc) {
                     trace(&ctx, Level::Error, &format!("Failed to set error body: {e}"));
                     return error_response(500, "Failed in set body after encryption in request", &ctx);
                 }
@@ -259,11 +376,26 @@ mod body {
             return Flow::Continue(());
         }
 
-        let encoded = String::from_utf8_lossy(body.as_slice());
-        let cleaned = strip_ws(&encoded);
-        match codec.open(&cleaned, &ctx) {
+        // Issue #13: ciphertext (base64) too large to even decode; also
+        // keeps us from spending CPU on absurdly large bodies.
+        if body.len() > MAX_BODY_BYTES {
+            trace(&ctx, Level::Error, &format!(
+                "Decrypt request body too large: {} bytes > {} byte limit",
+                body.len(), MAX_BODY_BYTES
+            ));
+            return error_response(413, "Request body exceeds policy maximum", &ctx);
+        }
+
+        // Byte-oriented decrypt (issue #9): the codec strips ASCII
+        // whitespace from the base64 input itself and returns raw bytes.
+        //
+        // Error classification (issue #15):
+        //   BadBase64 / Decrypt   → caller sent malformed ciphertext → 400
+        //   EntropyFailed         → not possible on decrypt; still 500
+        //   KeyLength / CipherInit → our key is bad → 500 (misconfig)
+        match codec.open(body.as_slice(), &ctx) {
             Ok(plain) => {
-                if let Err(e) = bh.set_body(plain.as_bytes()) {
+                if let Err(e) = bh.set_body(&plain) {
                     trace(&ctx, Level::Error, &format!("Failed to set error body: {e}"));
                     return error_response(500, "Failed in set body after decryption in request", &ctx);
                 }
@@ -272,7 +404,15 @@ mod body {
             }
             Err(e) => {
                 trace(&ctx, Level::Error, &format!("Decrypt request and replace Body - Decryption failed: {e}"));
-                error_response(500, "Internal Server Error", &ctx)
+                use crate::codec::CodecError::*;
+                match e {
+                    // Caller sent a malformed or tampered envelope — 400.
+                    BadBase64 | BadMagic | UnsupportedVersion(_) | MacMismatch | Decrypt(_) =>
+                        error_response(400, "Malformed ciphertext", &ctx),
+                    // Our key or host RNG is broken — 500.
+                    KeyLength | CipherInit(_) | EntropyFailed(_) =>
+                        error_response(500, "Internal Server Error", &ctx),
+                }
             }
         }
     }
@@ -287,10 +427,21 @@ mod body {
             return;
         }
 
-        let plaintext = String::from_utf8_lossy(body.as_ref()).to_string();
-        match codec.seal(&plaintext, &ctx) {
+        // Issue #13: oversize responses are passed through. We cannot
+        // reasonably rewrite status + content-type on the response leg
+        // without breaking the fail-closed contract (#10), so passthrough
+        // is the least-bad option here.
+        if body.len() > MAX_BODY_BYTES {
+            trace(&ctx, Level::Warn, &format!(
+                "Encrypt response body too large ({} bytes) — passing through unchanged",
+                body.len()
+            ));
+            return;
+        }
+
+        match codec.seal(body.as_ref(), &ctx) {
             Ok(enc) => {
-                if let Err(e) = bh.set_body(enc.as_bytes()) {
+                if let Err(e) = bh.set_body(&enc) {
                     trace(&ctx, Level::Error, &format!("Failed to set error body: {e}"));
                     write_error_body(bh, &ctx, "Failed in set body after encryption in response");
                     return;
@@ -314,11 +465,18 @@ mod body {
             return;
         }
 
-        let encoded = String::from_utf8_lossy(body.as_ref()).to_string();
-        let cleaned = strip_ws(&encoded);
-        match codec.open(&cleaned, &ctx) {
+        // Issue #13: same reasoning as encrypt_response.
+        if body.len() > MAX_BODY_BYTES {
+            trace(&ctx, Level::Warn, &format!(
+                "Decrypt response body too large ({} bytes) — passing through unchanged",
+                body.len()
+            ));
+            return;
+        }
+
+        match codec.open(body.as_ref(), &ctx) {
             Ok(plain) => {
-                if let Err(e) = bh.set_body(plain.as_bytes()) {
+                if let Err(e) = bh.set_body(&plain) {
                     trace(&ctx, Level::Error, &format!("Failed to set error body: {e}"));
                     write_error_body(bh, &ctx, "Failed in set body after decryption in response");
                     return;
@@ -349,7 +507,18 @@ mod body {
 /// media type lives in their `X-Content-Type`. We restore that onto
 /// `Content-Type` before the body transform.
 fn plan_request_header_swap(mode: Mode, headers: &HeaderBag) -> (HashMap<String, String>, Vec<&'static str>) {
-    let drop = vec!["Content-Type", "content-length"];
+    // Issue #14: anything that validates or sizes the pre-transform
+    // representation is now semantically stale. Strip them so clients
+    // don't match a conditional against the ciphertext (nor the other
+    // way around).
+    let drop = vec![
+        "Content-Type",
+        "content-length",
+        "ETag",
+        "Content-Digest",
+        "Repr-Digest",
+        "Content-Range",
+    ];
     let mut add = HashMap::new();
     match mode {
         Mode::Encrypt => {
@@ -386,7 +555,18 @@ fn plan_response_header_swap(
     upstream_ct: &str,
     upstream_xct: &str,
 ) -> (HashMap<String, String>, Vec<&'static str>) {
-    let drop = vec!["Content-Type", "content-length"];
+    // Issue #14: anything that validates or sizes the pre-transform
+    // representation is now semantically stale. Strip them so clients
+    // don't match a conditional against the ciphertext (nor the other
+    // way around).
+    let drop = vec![
+        "Content-Type",
+        "content-length",
+        "ETag",
+        "Content-Digest",
+        "Repr-Digest",
+        "Content-Range",
+    ];
     let mut add = HashMap::new();
 
     match mode {
@@ -452,6 +632,33 @@ async fn on_request_filter(
     if method != "GET" && request_leg_transforms {
         if let Flow::Break(resp) = require_header(hh, "x-content-type", &ctx) {
             return Flow::Break(resp);
+        }
+
+        // Issue #8: reject compressed/encoded bodies before we touch them.
+        if let Some(enc) = unsupported_encoding(hh) {
+            trace(&ctx, Level::Error, &format!(
+                "Request body has Content-Encoding {enc:?} — policy only supports 'identity'"
+            ));
+            return Flow::Break(
+                match error_response(415, "Unsupported Content-Encoding", &ctx) {
+                    Flow::Break(r) => r,
+                    _ => unreachable!(),
+                },
+            );
+        }
+
+        // Issue #13: reject streaming content types that never buffer as
+        // a single body.
+        if let Some(ct) = is_streaming_content_type(hh) {
+            trace(&ctx, Level::Error, &format!(
+                "Request body is streaming Content-Type {ct:?} — policy cannot transform"
+            ));
+            return Flow::Break(
+                match error_response(415, "Unsupported streaming Content-Type", &ctx) {
+                    Flow::Break(r) => r,
+                    _ => unreachable!(),
+                },
+            );
         }
     }
 
@@ -522,6 +729,28 @@ async fn on_response_filter(response_state: ResponseState, carry: RequestData<St
     let upstream_ct  = hh.header("Content-Type").unwrap_or_default();
     let upstream_xct = hh.header("X-Content-Type").unwrap_or_default();
 
+    // Issue #8: if the upstream response is compressed/encoded, we cannot
+    // safely base64 its bytes (encrypt) nor base64-decode them (decrypt).
+    // Pass the response through untouched — this is the only safe choice
+    // on the response leg, where we cannot return a new HTTP status
+    // without committing to a different Content-Type too.
+    if let Some(enc) = unsupported_encoding(hh) {
+        let ctx = TraceCtx::from_headers(&state.headers);
+        trace(&ctx, Level::Warn, &format!(
+            "Response has Content-Encoding {enc:?} — skipping transform, passing through"
+        ));
+        return;
+    }
+
+    // Issue #13: same reasoning for streaming response types.
+    if let Some(ct) = is_streaming_content_type(hh) {
+        let ctx = TraceCtx::from_headers(&state.headers);
+        trace(&ctx, Level::Warn, &format!(
+            "Response is streaming Content-Type {ct:?} — skipping transform, passing through"
+        ));
+        return;
+    }
+
     let codec = match Codec::from_b64_key(&state.secret) {
         Ok(c) => c,
         Err(_) => return,
@@ -565,8 +794,27 @@ async fn configure(
     let validated = ValidatedConfig::from_raw(cfg)
         .map_err(|e| anyhow!("Invalid policy configuration: {}", e))?;
 
+    // Issue #3 — namespace the cache by AWS authority so two policy
+    // instances using different AWS accounts/regions cannot share entries.
+    //
+    // The identity bundle is (region, SHA-256 of access key). We include a
+    // short hash of the access key rather than the key itself: it's stable
+    // per IAM principal, is NOT a secret (it's a one-way hash of a
+    // public access key ID), and reliably differs between two instances
+    // using different IAM users.
+    use sha2::{Digest, Sha256};
+    let key_hash_short: String = {
+        let hash = Sha256::digest(validated.raw.aws_access_key.as_bytes());
+        hex::encode(&hash[..6])
+    };
+    let cache_name = format!(
+        "{CACHE_NAME_PREFIX}:{}:{}",
+        validated.raw.aws_region,
+        key_hash_short,
+    );
+
     let cache = cache_builder
-        .new(CACHE_NAME.to_string())
+        .new(cache_name)
         .max_entries(validated.ttl.max_entries)
         .shared()
         .build();
