@@ -40,16 +40,26 @@ spec:
        default: ""
 
     # --- AWS Secrets Manager --------------------------------------------------
+    # awsAccessKey and awsAccessSecret are marked security:sensitive so API
+    # Manager renders them as masked password fields (no plaintext, no reveal
+    # affordance) and treats their values as secrets end-to-end (redacted in
+    # logs, excluded from export/diff, encrypted at rest in the control plane).
     awsAccessKey:
        type: string
        title: AWS Access Key
        description: AWS IAM access key ID with secretsmanager:GetSecretValue
        default: $AwsAccessKey
+       "@context":
+         "@characteristics":
+           - security:sensitive
     awsAccessSecret:
        type: string
        title: AWS Access Secret Key
        description: AWS IAM secret access key
        default: $AwsAccessSecretKey
+       "@context":
+         "@characteristics":
+           - security:sensitive
     awsRegion:
        type: string
        title: AWS Region

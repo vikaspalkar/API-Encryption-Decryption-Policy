@@ -6,11 +6,12 @@ edition = "2021"
 description = "AES-256-CBC encrypt/decrypt policy for Omni(Flex) Gateway, backed by AWS Secrets Manager"
 
 [package.metadata.anypoint]
-# Placeholder — before you `make publish` / `make release`, replace this
-# with your Anypoint Business Group UUID. See README Section 4 for the
-# full publish workflow. The nil UUID below is well-formed so the
-# `cargo-anypoint` tooling and local `make build` still succeed; only the
-# publish step actually needs a real org id.
+# This field holds your Anypoint Business Group UUID. The `anypoint-cli-v4
+# pdk policy-project build-asset-files` step validates it against the live
+# control plane and rejects any value that is not a real org UUID (the nil
+# UUID 00000000-... also fails), so there is no viable in-repo placeholder:
+# every clone must set this to a real org id before `make build` will run.
+# See README Section 4 step 3.
 group_id = "00000000-0000-0000-0000-000000000000"
 definition_asset_id = "api-encryption-decryption-policy"
 implementation_asset_id = "api-encryption-decryption-policy-wasm"

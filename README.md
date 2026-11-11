@@ -11,9 +11,13 @@ The AES key is **fetched at request time** from **AWS Secrets Manager**, cached 
 **Policy name in Anypoint Exchange:** `API Encryption Decryption Policy`
 **Current version:** `1.0.2`
 
-> ⚠️ **Before you publish:** this repo ships with a placeholder Anypoint
-> business-group ID in [Cargo.toml](Cargo.toml). You must replace it with
-> your own org's UUID — see
+> ⚠️ **Before you can build OR publish:** this repo ships with a nil
+> placeholder Anypoint business-group UUID
+> (`00000000-0000-0000-0000-000000000000`) in [Cargo.toml](Cargo.toml).
+> `make build` itself will fail against this placeholder because
+> `anypoint-cli-v4 pdk policy-project build-asset-files` validates the
+> UUID against the live control plane. **Replace it with your own org's
+> real UUID before running any `make` target** — see
 > [Section 4 — Installation, step 3](#option-b-build-and-publish-from-source).
 
 ## 2. Architecture
@@ -129,10 +133,13 @@ anypoint-cli-v4 conf organization <org-id>
 
 **3. Update your Anypoint organization / business-group ID:**
 
-> ⚠️ **Required before you can publish.** The repo ships with the nil
-> placeholder UUID `00000000-0000-0000-0000-000000000000`. `make build` and
-> `make test` work with it, but `make publish` / `make release` will fail
-> until you replace it with your own Anypoint business-group UUID.
+> ⚠️ **Required before any `make` target.** The repo ships with the nil
+> placeholder UUID `00000000-0000-0000-0000-000000000000`. `anypoint-cli-v4
+> pdk policy-project build-asset-files` validates the UUID against the live
+> Anypoint control plane and rejects non-org values — the nil UUID
+> included. `cargo test --lib` (Rust-only) works, but `make build`,
+> `make publish`, and `make release` all fail until you replace it with
+> your own Anypoint business-group UUID.
 
 Edit [Cargo.toml](Cargo.toml):
 
