@@ -67,9 +67,11 @@
 
 <h1>API Encryption Decryption Policy — Tester</h1>
 <div class="sub">
-  Encrypt / decrypt JSON payloads locally in the browser, using the same key
-  format the Omni(Flex) Gateway policy expects (base64 of IV ‖ ciphertext).
-  Policy version: 1.0.1.
+  Encrypt / decrypt JSON payloads locally in the browser, using the same
+  wire format the Omni(Flex) Gateway policy expects — <b>v2 envelope</b>:
+  base64(magic ‖ version ‖ IV ‖ ciphertext ‖ HMAC-SHA256). The MAC key is
+  derived from the AES key via HKDF-SHA256.
+  Policy version: 1.0.2 (v2 wire format).
 </div>
 
 <div class="panel">
@@ -147,16 +149,50 @@ function b64encode(bytes) {
   return btoa(s);
 }
 
-async function loadKey() {
+// ---------- v2 envelope ----------------------------------------------------
+//
+// Wire format (then base64):
+//   magic(2) = 0x4B 0x41 ("KA")
+//   version(1) = 0x02
+//   iv(16)
+//   ciphertext (16-byte blocks, PKCS#7)
+//   mac(32) = HMAC-SHA256(mac_key, magic || version || iv || ciphertext)
+//
+// mac_key = HKDF-SHA256(aes_key, salt=<empty>, info="api-encryption-decryption-policy/v2/mac-key", 32 bytes)
+
+const MAGIC = new Uint8Array([0x4B, 0x41]);
+const VERSION_V2 = 0x02;
+const MAC_KEY_LABEL = new TextEncoder().encode(
+  'api-encryption-decryption-policy/v2/mac-key'
+);
+
+async function deriveKeys() {
   const raw = document.getElementById('keyB64').value.trim();
   if (!raw) throw new Error('No key provided');
   const bytes = b64decode(raw);
   if (bytes.length !== 32) {
     throw new Error(`Key must be 32 bytes after base64 decode (got ${bytes.length})`);
   }
-  return await crypto.subtle.importKey(
+
+  // AES key — straight import.
+  const encKey = await crypto.subtle.importKey(
     'raw', bytes, { name: 'AES-CBC' }, false, ['encrypt', 'decrypt']
   );
+
+  // HKDF-SHA256 → 32-byte MAC key material → import as HMAC key.
+  const hkdfBase = await crypto.subtle.importKey(
+    'raw', bytes, 'HKDF', false, ['deriveBits']
+  );
+  const macRaw = new Uint8Array(await crypto.subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: MAC_KEY_LABEL },
+    hkdfBase,
+    256 /* bits */,
+  ));
+  const macKey = await crypto.subtle.importKey(
+    'raw', macRaw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']
+  );
+
+  return { encKey, macKey };
 }
 
 async function generateKey() {
@@ -167,48 +203,88 @@ async function generateKey() {
     `Generated new 32-byte key. Store this exact string in AWS Secrets Manager under aeskeys/<Source>.`);
 }
 
-// ---------- encrypt --------------------------------------------------------
+// Constant-time comparison (small arrays — we don't need to care about
+// Spectre-grade timing; just want to mimic the server's constant-time tag
+// check for correctness).
+function ctEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+
+// ---------- encrypt (v2) ---------------------------------------------------
 
 async function doEncrypt() {
   try {
-    const key = await loadKey();
+    const { encKey, macKey } = await deriveKeys();
     const plaintext = document.getElementById('plainIn').value;
     if (!plaintext) throw new Error('No plaintext to encrypt');
+    const plainBytes = new TextEncoder().encode(plaintext);
 
     const iv = crypto.getRandomValues(new Uint8Array(16));
     const ciphertext = new Uint8Array(await crypto.subtle.encrypt(
-      { name: 'AES-CBC', iv }, key, new TextEncoder().encode(plaintext)
+      { name: 'AES-CBC', iv }, encKey, plainBytes
     ));
 
-    const wire = new Uint8Array(iv.length + ciphertext.length);
-    wire.set(iv, 0);
-    wire.set(ciphertext, iv.length);
+    // Pre-MAC prefix: magic || version || iv || ciphertext
+    const prefix = new Uint8Array(2 + 1 + 16 + ciphertext.length);
+    prefix.set(MAGIC, 0);
+    prefix[2] = VERSION_V2;
+    prefix.set(iv, 3);
+    prefix.set(ciphertext, 19);
+
+    const tag = new Uint8Array(await crypto.subtle.sign('HMAC', macKey, prefix));
+
+    const wire = new Uint8Array(prefix.length + tag.length);
+    wire.set(prefix, 0);
+    wire.set(tag, prefix.length);
 
     document.getElementById('cipherOut').value = b64encode(wire);
     setStatus('encStatus', 'ok',
-      `Encrypted — IV (16 bytes) + ciphertext (${ciphertext.length} bytes) → ${wire.length} bytes total`);
+      `Encrypted v2 — header(3) + iv(16) + ciphertext(${ciphertext.length}) + mac(32) = ${wire.length} bytes`);
     setStatus('keyStatus', 'info', 'Key loaded OK.');
   } catch (e) {
     setStatus('encStatus', 'err', `Encrypt failed: ${e.message}`);
   }
 }
 
-// ---------- decrypt --------------------------------------------------------
+// ---------- decrypt (v2) ---------------------------------------------------
 
 async function doDecrypt() {
   try {
-    const key = await loadKey();
+    const { encKey, macKey } = await deriveKeys();
     const wireB64 = document.getElementById('cipherIn').value.trim();
     if (!wireB64) throw new Error('No wire body to decrypt');
 
     const wire = b64decode(wireB64);
-    if (wire.length < 17) throw new Error('Wire body too short (expected IV + ciphertext)');
+    const MIN = 3 + 16 + 16 + 32;  // magic+ver + iv + 1 block + mac
+    if (wire.length < MIN) {
+      throw new Error(`Wire body too short (${wire.length} bytes, expected at least ${MIN})`);
+    }
 
-    const iv = wire.slice(0, 16);
-    const ciphertext = wire.slice(16);
+    if (wire[0] !== MAGIC[0] || wire[1] !== MAGIC[1]) {
+      throw new Error('Not a v2 envelope — magic bytes do not match');
+    }
+    if (wire[2] !== VERSION_V2) {
+      throw new Error(`Unsupported envelope version 0x${wire[2].toString(16).padStart(2,'0')}`);
+    }
+
+    // Split into (data | mac)
+    const macStart = wire.length - 32;
+    const data = wire.subarray(0, macStart);
+    const tag = wire.subarray(macStart);
+
+    const expected = new Uint8Array(await crypto.subtle.sign('HMAC', macKey, data));
+    if (!ctEqual(expected, tag)) {
+      throw new Error('MAC verification failed — envelope tampered or wrong key');
+    }
+
+    const iv = data.subarray(3, 3 + 16);
+    const ciphertext = data.subarray(3 + 16);
 
     const plainBytes = await crypto.subtle.decrypt(
-      { name: 'AES-CBC', iv }, key, ciphertext
+      { name: 'AES-CBC', iv }, encKey, ciphertext
     );
     const plaintext = new TextDecoder().decode(plainBytes);
     document.getElementById('plainOut').value = plaintext;
@@ -220,11 +296,11 @@ async function doDecrypt() {
     } catch {}
 
     setStatus('decStatus', 'ok',
-      `Decrypted ${ciphertext.length} ciphertext bytes → ${plainBytes.byteLength} plaintext bytes`);
+      `Decrypted v2 — ${ciphertext.length} ciphertext bytes → ${plainBytes.byteLength} plaintext bytes (MAC verified)`);
     setStatus('keyStatus', 'info', 'Key loaded OK.');
   } catch (e) {
     setStatus('decStatus', 'err',
-      `Decrypt failed: ${e.message}. Common causes: wrong key, truncated wire body, or wire body isn't base64(IV ‖ ciphertext).`);
+      `Decrypt failed: ${e.message}. Common causes: wrong key, non-v2 envelope, or MAC tampering.`);
   }
 }
 
