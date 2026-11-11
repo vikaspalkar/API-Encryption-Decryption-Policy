@@ -6,7 +6,7 @@ edition = "2021"
 description = "AES-256-CBC encrypt/decrypt policy for Omni(Flex) Gateway, backed by AWS Secrets Manager"
 
 [package.metadata.anypoint]
-group_id = "YOUR-ANYPOINT-BUSINESS-GROUP-UUID"
+group_id = "37289ac4-fbe0-43a3-a3e3-7846cb0153e2"
 definition_asset_id = "api-encryption-decryption-policy"
 implementation_asset_id = "api-encryption-decryption-policy-wasm"
 

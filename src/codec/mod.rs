@@ -27,6 +27,10 @@ const IV_BYTES: usize = 16;
 pub enum CodecError {
     /// Base64-decoded key was not 32 bytes long.
     KeyLength,
+    /// Host failed to produce random bytes for the IV. On a WASM host this
+    /// happens if the `random_get` ABI is unavailable or refused — never
+    /// substitute a fixed IV; fail closed instead.
+    EntropyFailed(String),
     /// Ciphertext was not valid base64.
     BadBase64,
     /// Underlying block-mode library rejected the key/IV pair.
@@ -40,11 +44,12 @@ pub enum CodecError {
 impl fmt::Display for CodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::KeyLength     => f.write_str("Missing or Invalid AES Key"),
-            Self::BadBase64     => f.write_str("Base64 decoding failed"),
-            Self::CipherInit(e) => write!(f, "Cipher creation failed: {e}"),
-            Self::Decrypt(e)    => write!(f, "AES decryption failed: {e}"),
-            Self::NotUtf8(e)    => write!(f, "UTF-8 conversion failed: {e}"),
+            Self::KeyLength        => f.write_str("Missing or Invalid AES Key"),
+            Self::EntropyFailed(e) => write!(f, "IV entropy generation failed: {e}"),
+            Self::BadBase64        => f.write_str("Base64 decoding failed"),
+            Self::CipherInit(e)    => write!(f, "Cipher creation failed: {e}"),
+            Self::Decrypt(e)       => write!(f, "AES decryption failed: {e}"),
+            Self::NotUtf8(e)       => write!(f, "UTF-8 conversion failed: {e}"),
         }
     }
 }
@@ -75,9 +80,17 @@ impl Codec {
     }
 
     /// Encrypt plaintext to `base64(iv || ciphertext)`.
+    ///
+    /// On entropy failure this returns [`CodecError::EntropyFailed`] — the
+    /// caller must treat that as a fail-closed condition and return a
+    /// controlled HTTP 5xx. It must never substitute a fixed or predictable
+    /// IV.
     pub fn seal(&self, plaintext: &str, ctx: &TraceCtx<'_>) -> Result<String, CodecError> {
         let mut iv = [0u8; IV_BYTES];
-        getrandom::getrandom(&mut iv).expect("Failed to generate IV");
+        if let Err(e) = getrandom::getrandom(&mut iv) {
+            trace(ctx, Level::Error, &format!("Encrypt Payload - IV entropy failed: {e}"));
+            return Err(CodecError::EntropyFailed(e.to_string()));
+        }
 
         let cipher = self.cipher(&iv).map_err(|e| {
             trace(ctx, Level::Error, &format!("Encrypt Payload - Cipher creation failed: {e}"));

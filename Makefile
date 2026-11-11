@@ -44,6 +44,7 @@ build-asset-files: $(DEFINITION_SRC_GCL_PATH)
 		cp definition/target/schema.json definition/target/definition/schema.json 2>/dev/null || true; \
 	fi
 	@cargo anypoint config-gen -p -m $(DEFINITION_SRC_GCL_PATH) -o src/generated/config.rs
+	@python3 scripts/redact_generated_config.py src/generated/config.rs
 
 .PHONY: test
 test: ## Run unit tests

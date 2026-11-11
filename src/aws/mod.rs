@@ -142,10 +142,15 @@ pub async fn fetch_secret_string(
     let date_stamp = now.format("%Y%m%d").to_string();
 
     // Request body: SecretsManager accepts a single JSON object.
-    let payload = format!(r#"{{"SecretId":"{secret_id}"}}"#);
+    // Build it via serde (issue #2) so a caller-supplied SecretId cannot
+    // inject sibling fields such as `VersionStage` into the signed body.
+    #[derive(serde::Serialize)]
+    struct GetSecretValueRequest<'a> { #[serde(rename = "SecretId")] secret_id: &'a str }
+    let payload = serde_json::to_vec(&GetSecretValueRequest { secret_id })
+        .expect("GetSecretValueRequest is always serialisable");
 
     let (_canonical, string_to_sign, credential_scope) =
-        build_sigv4_strings(&host, &amz_date, &date_stamp, &creds.region, payload.as_bytes());
+        build_sigv4_strings(&host, &amz_date, &date_stamp, &creds.region, &payload);
 
     // Derive key, HMAC the string_to_sign, hex-encode → signature.
     let signing_key = derive_signing_key(&creds.secret_key, &date_stamp, &creds.region, SERVICE);
@@ -166,7 +171,7 @@ pub async fn fetch_secret_string(
             ("X-Amz-Target",  TARGET_OP),
             ("Authorization", &auth_header),
         ])
-        .body(payload.as_bytes())
+        .body(&payload)
         .post()
         .await
         .map_err(|e| {

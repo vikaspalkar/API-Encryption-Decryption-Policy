@@ -230,6 +230,19 @@ async function doDecrypt() {
 
 // ---------- curl builder ---------------------------------------------------
 
+// Shell-safe single-quote wrap: any ' in the value becomes '\'' which
+// closes, escapes, and reopens the quoted string. Every other character —
+// including $, `, newlines — is treated literally by POSIX shells inside
+// single quotes.
+function shq(s) {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+
+// Only these HTTP methods are allowed from the picker. A rogue method
+// value injected from DOM manipulation is rejected before building the
+// command.
+const ALLOWED_METHODS = new Set(['POST', 'PUT', 'PATCH']);
+
 function buildCurl() {
   const wire = document.getElementById('cipherOut').value.trim();
   if (!wire) {
@@ -238,8 +251,10 @@ function buildCurl() {
     return;
   }
   const url = document.getElementById('url').value;
-  const method = document.getElementById('method').value;
+  const rawMethod = document.getElementById('method').value;
   const source = document.getElementById('source').value;
+
+  const method = ALLOWED_METHODS.has(rawMethod) ? rawMethod : 'POST';
 
   // Try to detect the real content type from the plaintext input
   let xContentType = 'application/json';
@@ -249,11 +264,14 @@ function buildCurl() {
     xContentType = 'text/plain';
   }
 
-  const cmd = `curl -i -X ${method} "${url}" \\
-  -H "Content-Type: application/octet-stream" \\
-  -H "X-Content-Type: ${xContentType}" \\
-  -H "Source: ${source}" \\
-  --data-binary "${wire}"`;
+  // Every dynamic value is single-quote-wrapped. The method itself is
+  // whitelisted above so it's safe to interpolate without quoting.
+  const cmd =
+    'curl -i -X ' + method + ' ' + shq(url) + ' \\\n' +
+    '  -H ' + shq('Content-Type: application/octet-stream') + ' \\\n' +
+    '  -H ' + shq('X-Content-Type: ' + xContentType) + ' \\\n' +
+    '  -H ' + shq('Source: ' + source) + ' \\\n' +
+    '  --data-binary ' + shq(wire);
 
   document.getElementById('curlOut').innerText = cmd;
 }
