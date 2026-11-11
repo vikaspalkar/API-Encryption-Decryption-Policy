@@ -33,22 +33,48 @@ impl SecretsManagerCreds {
     }
 }
 
-/// Errors that `fetch_secret_string` can return.
+/// Errors that `fetch_secret_string` can return. Each variant carries
+/// semantic meaning so the caller can map it to the right HTTP status
+/// (issue #15) — caller-supplied bad input is 4xx, our own problems are
+/// 5xx, and dependency outages are 5xx too (503).
 #[derive(Debug)]
 pub enum AwsSecretError {
+    /// Transport-level failure calling AWS (connection reset, DNS, TLS).
+    /// Caller should return 503.
     HttpClient(String),
+    /// AWS returned a response but it wasn't JSON. Treat as a dependency
+    /// outage — 503.
     JsonParse,
-    InvalidUri,
+    /// A ResourceNotFoundException from AWS — the named secret does not
+    /// exist. This is almost always a caller mistake (bad Source header).
+    /// Caller should return 400.
+    NotFound,
+    /// AWS refused the signed request (SigV4 rejected, IAM policy denied,
+    /// invalid access key, expired STS token). This is a policy
+    /// MISCONFIGURATION, not a caller problem. Caller should return 500.
+    AuthFailed(String),
+    /// AWS throttled or returned an internal failure. Transient dependency
+    /// state — caller should return 503.
+    Throttled(String),
+    /// AWS returned a well-formed JSON response but it's missing the
+    /// `SecretString` field. Usually means the secret is stored as
+    /// `SecretBinary`, which this policy does not support. 500.
     MissingSecretString,
+    /// Other AWS-side error identified by an `__type` we don't handle
+    /// specifically. 503 by default — treat as dependency.
+    Other(String),
 }
 
 impl fmt::Display for AwsSecretError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::HttpClient(m) => write!(f, "HTTP client error while fetching secret: {m:?}"),
-            Self::JsonParse     => f.write_str("Failed to parse secret JSON"),
-            Self::InvalidUri    => f.write_str("Invalid URI used in secret fetch"),
-            Self::MissingSecretString => f.write_str("SecretString not found in AWS response"),
+            Self::HttpClient(m)       => write!(f, "HTTP client error while fetching secret: {m:?}"),
+            Self::JsonParse           => f.write_str("Failed to parse secret JSON"),
+            Self::NotFound            => f.write_str("Secret not found in AWS Secrets Manager"),
+            Self::AuthFailed(m)       => write!(f, "AWS rejected the signed request: {m}"),
+            Self::Throttled(m)        => write!(f, "AWS throttled or unavailable: {m}"),
+            Self::MissingSecretString => f.write_str("Secret value has no SecretString (likely stored as SecretBinary)"),
+            Self::Other(m)            => write!(f, "AWS error: {m}"),
         }
     }
 }
@@ -61,7 +87,42 @@ impl From<serde_json::Error> for AwsSecretError {
     fn from(_: serde_json::Error) -> Self { Self::JsonParse }
 }
 impl From<pdk::hl::InvalidUri> for AwsSecretError {
-    fn from(_: pdk::hl::InvalidUri) -> Self { Self::InvalidUri }
+    fn from(_: pdk::hl::InvalidUri) -> Self { Self::HttpClient("invalid URI".into()) }
+}
+
+/// Map an AWS Secrets Manager error response into a typed `AwsSecretError`.
+/// AWS returns a 400 with JSON like `{"__type":"ResourceNotFoundException",...}`
+/// for domain errors and a 400/5xx with the same shape for infra errors.
+fn classify_aws_error(status: u32, body_json: &serde_json::Value) -> AwsSecretError {
+    let ty = body_json
+        .get("__type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let msg = body_json
+        .get("Message")
+        .or_else(|| body_json.get("message"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Error type (if present) is the authoritative signal — AWS always
+    // returns 400 even for 5xx-worthy conditions.
+    match ty {
+        "ResourceNotFoundException" => AwsSecretError::NotFound,
+        "AccessDeniedException"
+        | "UnrecognizedClientException"
+        | "InvalidSignatureException"
+        | "ExpiredTokenException"
+        | "InvalidClientTokenId" => AwsSecretError::AuthFailed(ty.to_string()),
+        "ThrottlingException"
+        | "InternalServiceError"
+        | "InternalFailure"
+        | "ServiceUnavailable"
+        | "SlowDown" => AwsSecretError::Throttled(ty.to_string()),
+        "" if status >= 500 => AwsSecretError::Throttled(format!("HTTP {status}")),
+        "" if status == 403 => AwsSecretError::AuthFailed(format!("HTTP {status}")),
+        "" if status == 400 => AwsSecretError::Other(format!("HTTP 400 no __type: {msg}")),
+        _ => AwsSecretError::Other(format!("{ty}: {msg} (HTTP {status})")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -179,12 +240,22 @@ pub async fn fetch_secret_string(
             AwsSecretError::HttpClient(format!("{e:?}"))
         })?;
 
-    trace(ctx, Level::Info, "Get secret from AWS - Received response from AWS: \"\"");
+    let status = response.status_code();
+    trace(ctx, Level::Info, &format!("Get secret from AWS - HTTP {status}"));
 
     let json: serde_json::Value = serde_json::from_slice(response.body()).map_err(|e| {
         trace(ctx, Level::Error, &format!("Get secret from AWS - Failed to parse secret JSON: {e:?}"));
         AwsSecretError::JsonParse
     })?;
+
+    // Non-200 responses: classify the __type from AWS so the caller can
+    // map ResourceNotFoundException → 400, AccessDenied → 500, throttling
+    // → 503, etc. (issue #15).
+    if status != 200 {
+        let err = classify_aws_error(status, &json);
+        trace(ctx, Level::Error, &format!("Get secret from AWS - error: {err}"));
+        return Err(err);
+    }
 
     json.get("SecretString")
         .and_then(|v| v.as_str())
