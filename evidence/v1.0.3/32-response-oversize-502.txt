@@ -1,0 +1,15 @@
+HTTP/1.1 502 Bad Gateway
+access-control-allow-credentials: true
+access-control-allow-origin: *
+access-control-expose-headers: Retry-After, RateLimit, RateLimit-Policy, WWW-Authenticate
+x-content-type-options: nosniff
+date: Thu, 12 Nov 2026 11:10:00 GMT
+content-type: application/json
+server: Anypoint Flex Gateway
+x-envoy-decorator-operation: api-instance-21294366.edc1ebcc-bf80-423a-b46a-192b3fc86794.svc
+transfer-encoding: chunked
+x-correlation-id: d0a14126-e7aa-4242-8fa0-c2d00629bfcc
+Strict-Transport-Security: max-age=31536000; includeSubdomains
+Connection: Keep-Alive
+
+{"errorMessage":"Upstream response exceeds policy size limit","source":"partnerA"}

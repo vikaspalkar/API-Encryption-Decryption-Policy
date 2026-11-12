@@ -1,0 +1,11 @@
+HTTP/1.1 415 Unsupported Media Type
+content-type: application/json
+content-length: 73
+date: Thu, 12 Nov 2026 10:52:03 GMT
+server: Anypoint Flex Gateway
+x-envoy-decorator-operation: api-instance-21294366.edc1ebcc-bf80-423a-b46a-192b3fc86794.svc
+x-correlation-id: 6cb582d4-b7be-4c2d-8a1a-0df8ece1c3e4
+Strict-Transport-Security: max-age=31536000; includeSubdomains
+Connection: Keep-Alive
+
+{"errorMessage":"Unsupported streaming Content-Type","source":"partnerA"}

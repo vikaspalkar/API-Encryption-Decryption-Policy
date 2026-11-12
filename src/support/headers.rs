@@ -10,23 +10,30 @@ use std::collections::HashMap;
 use pdk::hl::*;
 use regex::Regex;
 
-use super::TraceCtx;
 use super::log::{emit, Level};
 use super::reply::error_response;
+use super::TraceCtx;
 
 /// Lowercase header snapshot built from an incoming request.
 pub type HeaderBag = HashMap<String, String>;
 
 /// Pull a fixed set of headers into a lowercase map.
 ///
-/// Every requested name is present in the output — missing headers map to
-/// the empty string, which matches the original behaviour.
+/// Issue #20: only headers that were actually present on the request are
+/// inserted. Callers use `bag.get(name)` which returns `None` for an
+/// absent header and `Some("")` for a present-but-empty header — the
+/// two must stay distinguishable so downstream fall-through logic
+/// (e.g. `plan_request_header_swap`'s "default to octet-stream") fires
+/// only when the caller genuinely did not send the header.
+///
+/// Pre-#20 behavior silently converted missing → `Some("")`, which
+/// defeated every Option-aware consumer.
 pub fn snapshot(h: &dyn HeadersHandler, wanted: &[&str]) -> HeaderBag {
     wanted
         .iter()
-        .map(|name| {
-            let value = h.header(name).unwrap_or_default();
-            (name.to_ascii_lowercase(), value)
+        .filter_map(|name| {
+            h.header(name)
+                .map(|value| (name.to_ascii_lowercase(), value))
         })
         .collect()
 }
@@ -42,18 +49,17 @@ pub fn require(h: &dyn HeadersHandler, name: &str, ctx: &TraceCtx<'_>) -> Flow<(
         return Flow::Continue(());
     }
 
-    emit(ctx, Level::Error, &format!("Required Header - Missing or empty required header {name}"));
+    emit(
+        ctx,
+        Level::Error,
+        &format!("Required Header - Missing or empty required header {name}"),
+    );
     error_response(400, "Missing or empty required header", ctx)
 }
 
 /// Validate a header against a regex. Missing header → 400.
 #[allow(dead_code)]
-pub fn match_regex(
-    h: &dyn HeadersHandler,
-    name: &str,
-    re: &Regex,
-    ctx: &TraceCtx<'_>,
-) -> Flow<()> {
+pub fn match_regex(h: &dyn HeadersHandler, name: &str, re: &Regex, ctx: &TraceCtx<'_>) -> Flow<()> {
     match h.header(name) {
         Some(v) if re.is_match(&v) => Flow::Continue(()),
         Some(_) => {
@@ -61,7 +67,11 @@ pub fn match_regex(
             error_response(400, &format!("Invalid header format: {name}"), ctx)
         }
         None => {
-            emit(ctx, Level::Error, &format!("Required Header - Missing or empty required header {name}"));
+            emit(
+                ctx,
+                Level::Error,
+                &format!("Required Header - Missing or empty required header {name}"),
+            );
             error_response(400, "Missing or empty required header", ctx)
         }
     }
@@ -70,11 +80,7 @@ pub fn match_regex(
 /// Add / overwrite one set of headers, then drop another set.
 ///
 /// Order (remove-then-add) matches the legacy behaviour.
-pub fn mutate(
-    h: &dyn HeadersHandler,
-    add: &HashMap<String, String>,
-    drop: &[&str],
-) {
+pub fn mutate(h: &dyn HeadersHandler, add: &HashMap<String, String>, drop: &[&str]) {
     for k in drop {
         h.remove_header(k);
     }

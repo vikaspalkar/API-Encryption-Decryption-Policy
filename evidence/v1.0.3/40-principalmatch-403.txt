@@ -1,0 +1,11 @@
+HTTP/1.1 403 Forbidden
+content-type: application/json
+content-length: 70
+date: Thu, 12 Nov 2026 11:13:41 GMT
+server: Anypoint Flex Gateway
+x-envoy-decorator-operation: api-instance-21294366.edc1ebcc-bf80-423a-b46a-192b3fc86794.svc
+x-correlation-id: aa4d1948-0b79-42b0-8564-2a17bbca0f26
+Strict-Transport-Security: max-age=31536000; includeSubdomains
+Connection: Keep-Alive
+
+{"errorMessage":"Not authorized to select Source","source":"partnerA"}

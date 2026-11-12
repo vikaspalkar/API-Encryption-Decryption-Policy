@@ -1,0 +1,11 @@
+HTTP/1.1 400 Bad Request
+content-type: application/json
+content-length: 70
+date: Thu, 12 Nov 2026 10:52:42 GMT
+server: Anypoint Flex Gateway
+x-envoy-decorator-operation: api-instance-21294366.edc1ebcc-bf80-423a-b46a-192b3fc86794.svc
+x-correlation-id: 7cd92efa-ee15-4404-a622-1b70845e7ab8
+Strict-Transport-Security: max-age=31536000; includeSubdomains
+Connection: Keep-Alive
+
+{"errorMessage":"Missing or invalid  Source","source":"../etc/passwd"}

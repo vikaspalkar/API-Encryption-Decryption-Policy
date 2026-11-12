@@ -8,19 +8,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use pdk::cache::Cache;
 use serde::{Deserialize, Serialize};
 
-use super::TraceCtx;
 use super::log::{emit, Level};
+use super::TraceCtx;
 
 /// Policy-wide cache knobs.
 #[derive(Clone)]
 pub struct TtlPolicy {
     pub max_entries: usize,
-    pub ttl_secs:    u64,
+    pub ttl_secs: u64,
 }
 
 #[derive(Serialize, Deserialize)]
 struct Entry {
-    value:     String,
+    value: String,
     timestamp: u64,
 }
 
@@ -35,7 +35,12 @@ fn now_secs() -> u64 {
 /// Return the cached value for `key` iff it's still within TTL.
 ///
 /// Expired entries are deleted lazily so the cache doesn't grow unbounded.
-pub fn get(cache: &impl Cache, policy: &TtlPolicy, key: &str, ctx: &TraceCtx<'_>) -> Option<String> {
+pub fn get(
+    cache: &impl Cache,
+    policy: &TtlPolicy,
+    key: &str,
+    ctx: &TraceCtx<'_>,
+) -> Option<String> {
     let bytes = cache.get(key)?;
 
     let entry: Entry = match serde_json::from_slice(&bytes) {
@@ -60,7 +65,10 @@ pub fn get(cache: &impl Cache, policy: &TtlPolicy, key: &str, ctx: &TraceCtx<'_>
 
 /// Store `value` under `key`, stamping it with the current time.
 pub fn put(cache: &impl Cache, _policy: &TtlPolicy, key: &str, value: &str) -> anyhow::Result<()> {
-    let entry = Entry { value: value.to_owned(), timestamp: now_secs() };
+    let entry = Entry {
+        value: value.to_owned(),
+        timestamp: now_secs(),
+    };
     let bytes = serde_json::to_vec(&entry)?;
     Ok(cache.save(key, bytes)?)
 }

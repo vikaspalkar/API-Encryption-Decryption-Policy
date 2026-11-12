@@ -1,0 +1,18 @@
+  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0  0     0    0     0    0     0      0      0 --:--:--  0:00:01 --:--:--     0  0     0    0     0    0     0      0      0 --:--:--  0:00:02 --:--:--     0  0     0    0     0    0     0      0      0 --:--:--  0:00:03 --:--:--     0  0     0    0     0    0     0      0      0 --:--:--  0:00:04 --:--:--     0  0     0    0     0    0     0      0      0 --:--:--  0:00:05 --:--:--     0  0     0    0     0    0     0      0      0 --:--:--  0:00:06 --:--:--     0100   108    0   108    0     0     16      0 --:--:--  0:00:06 --:--:--    26
+HTTP/1.1 502 Bad Gateway
+access-control-allow-credentials: true
+access-control-allow-origin: *
+access-control-expose-headers: Retry-After, RateLimit, RateLimit-Policy, WWW-Authenticate
+x-content-type-options: nosniff
+date: Thu, 12 Nov 2026 11:28:21 GMT
+content-type: application/json
+server: Anypoint Flex Gateway
+x-envoy-decorator-operation: api-instance-21294366.edc1ebcc-bf80-423a-b46a-192b3fc86794.svc
+transfer-encoding: chunked
+x-correlation-id: b1df1bab-0f6c-4cd9-93ab-a222535b1b60
+Strict-Transport-Security: max-age=31536000; includeSubdomains
+Connection: Keep-Alive
+
+{"errorMessage":"Upstream response Content-Type is streaming and cannot be transformed","source":"partnerA"}

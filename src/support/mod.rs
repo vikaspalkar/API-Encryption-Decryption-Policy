@@ -11,7 +11,8 @@ pub mod reply;
 
 use std::collections::HashMap;
 
-pub use headers::HeaderBag;
+// HeaderBag is re-exported through `crate::support::headers::HeaderBag`
+// directly; we don't re-export it here to avoid a dead import.
 
 /// Context carried through every log line and error response.
 ///

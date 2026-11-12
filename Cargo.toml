@@ -1,6 +1,6 @@
 [package]
 name = "api_encryption_decryption_policy"
-version = "1.0.2"
+version = "1.0.3"
 rust-version = "1.83.0"
 edition = "2021"
 description = "AES-256-CBC encrypt/decrypt policy for Omni(Flex) Gateway, backed by AWS Secrets Manager"
@@ -45,6 +45,14 @@ regex        = "1.11.2"
 
 [dev-dependencies]
 pdk-unit = { version = "1.10.0", features = ["enable_stop_iteration"] }
+# Integration tests (tests/requests.rs) run against a real local-mode Flex
+# container via Docker. `cargo test --test requests --no-run` must compile
+# cleanly even on a machine without Docker; actually running them requires
+# Docker on the developer's machine (see Makefile `make test-integration`).
+pdk-test = "1.10.0"
+httpmock = { version = "0.7", features = ["remote"] }
+reqwest  = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [profile.release]
 lto       = true

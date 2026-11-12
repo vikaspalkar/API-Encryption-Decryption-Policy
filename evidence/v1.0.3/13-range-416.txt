@@ -1,0 +1,11 @@
+HTTP/1.1 416 Range Not Satisfiable
+content-type: application/json
+content-length: 88
+date: Thu, 12 Nov 2026 10:52:34 GMT
+server: Anypoint Flex Gateway
+x-envoy-decorator-operation: api-instance-21294366.edc1ebcc-bf80-423a-b46a-192b3fc86794.svc
+x-correlation-id: b155fcd7-f0de-42a7-9bdb-dc9e8b89b8a6
+Strict-Transport-Security: max-age=31536000; includeSubdomains
+Connection: Keep-Alive
+
+{"errorMessage":"Range requests not supported on transforming legs","source":"partnerA"}

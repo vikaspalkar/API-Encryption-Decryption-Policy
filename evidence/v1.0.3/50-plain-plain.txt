@@ -1,0 +1,39 @@
+HTTP/1.1 200 OK
+access-control-allow-credentials: true
+access-control-allow-origin: *
+access-control-expose-headers: Retry-After, RateLimit, RateLimit-Policy, WWW-Authenticate
+content-length: 695
+content-type: application/json
+x-content-type-options: nosniff
+date: Thu, 12 Nov 2026 11:11:21 GMT
+server: Anypoint Flex Gateway
+x-envoy-decorator-operation: api-instance-21294366.edc1ebcc-bf80-423a-b46a-192b3fc86794.svc
+x-correlation-id: ac24239b-773a-494b-90d3-55f156e4a088
+Strict-Transport-Security: max-age=31536000; includeSubdomains
+Connection: Keep-Alive
+
+{
+  "args": {},
+  "headers": {
+    "Accept": "*/*",
+    "Content-Length": "10",
+    "Content-Type": "application/json",
+    "Etag": "\"abc123\"",
+    "Host": "httpbin.org",
+    "Source": "partnerA",
+    "Traceparent": "00-f38a137c227222847b86ef2bbb07f6c5-9603ae68a9edb42a-01",
+    "Tracestate": "",
+    "User-Agent": "curl/8.7.1",
+    "X-Correlation-Id": "ac24239b-773a-494b-90d3-55f156e4a088",
+    "X-Forwarded-Host": "vp-omni-gateway-shared-x89y1k.yz4tr9-1.aus-s1.cloudhub.io"
+  },
+  "method": "POST",
+  "origin": "104.161.246.3,100.64.100.181,52.64.167.139",
+  "url": "https://httpbin.org/anything/pass",
+  "data": "{\"ping\":1}",
+  "files": {},
+  "form": {},
+  "json": {
+    "ping": 1
+  }
+}

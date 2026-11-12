@@ -47,9 +47,19 @@ build-asset-files: $(DEFINITION_SRC_GCL_PATH)
 	@python3 scripts/redact_generated_config.py src/generated/config.rs
 
 .PHONY: test
-test: ## Run unit tests (Rust + redactor regression suite)
+test: ## Run unit tests (Rust + redactor regression suite) and verify integration tests compile
 	@cargo test --lib
+	@cargo test --test requests --no-run
 	@python3 -I scripts/test_redact_generated_config.py
+
+.PHONY: test-integration
+test-integration: ## Run full integration tests against a real Flex container (requires Docker)
+	@cargo test --test requests
+
+.PHONY: lint
+lint: ## cargo fmt --check + cargo clippy -D warnings (reviewer #21 gate)
+	@cargo fmt --check
+	@cargo clippy --lib --tests -- -D warnings
 
 .PHONY: publish
 publish: build ## Publish a development version of the policy

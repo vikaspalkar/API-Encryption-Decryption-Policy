@@ -24,11 +24,13 @@ pub struct Config {
     pub request_mode: String,
     #[serde(alias = "responseMode")]
     pub response_mode: String,
+    #[serde(alias = "sourceBinding")]
+    pub source_binding: Option<String>,
 }
 #[pdk::hl::entrypoint_flex]
 fn init(abi: &dyn pdk::flex_abi::api::FlexAbi) -> Result<(), anyhow::Error> {
     let config: Config = serde_json::from_slice(abi.get_configuration())
-        .map_err(|err| anyhow::anyhow!("Failed to parse policy configuration: {}", err))?;
+        .map_err(|err| anyhow::anyhow!("Failed to parse policy configuration: {} at line {}, column {}", match err.classify() { serde_json::error::Category::Io => "I/O", serde_json::error::Category::Syntax => "malformed JSON", serde_json::error::Category::Data => "type or structure mismatch", serde_json::error::Category::Eof => "unexpected end of input" }, err.line(), err.column()))?;
     abi.service_create(config.aws_service)?;
     abi.setup()?;
     Ok(())

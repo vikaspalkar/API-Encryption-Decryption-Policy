@@ -12,8 +12,8 @@ use hmac::{Hmac, Mac};
 use pdk::hl::*;
 use sha2::{Digest, Sha256};
 
-use crate::support::TraceCtx;
 use crate::support::log::{emit as trace, Level};
+use crate::support::TraceCtx;
 
 const SIGN_ALGO: &str = "AWS4-HMAC-SHA256";
 const SERVICE: &str = "secretsmanager";
@@ -29,7 +29,11 @@ pub struct SecretsManagerCreds {
 
 impl SecretsManagerCreds {
     pub fn new(access_key: String, secret_key: String, region: String) -> Self {
-        Self { access_key, secret_key, region }
+        Self {
+            access_key,
+            secret_key,
+            region,
+        }
     }
 }
 
@@ -68,26 +72,34 @@ pub enum AwsSecretError {
 impl fmt::Display for AwsSecretError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::HttpClient(m)       => write!(f, "HTTP client error while fetching secret: {m:?}"),
-            Self::JsonParse           => f.write_str("Failed to parse secret JSON"),
-            Self::NotFound            => f.write_str("Secret not found in AWS Secrets Manager"),
-            Self::AuthFailed(m)       => write!(f, "AWS rejected the signed request: {m}"),
-            Self::Throttled(m)        => write!(f, "AWS throttled or unavailable: {m}"),
-            Self::MissingSecretString => f.write_str("Secret value has no SecretString (likely stored as SecretBinary)"),
-            Self::Other(m)            => write!(f, "AWS error: {m}"),
+            Self::HttpClient(m) => write!(f, "HTTP client error while fetching secret: {m:?}"),
+            Self::JsonParse => f.write_str("Failed to parse secret JSON"),
+            Self::NotFound => f.write_str("Secret not found in AWS Secrets Manager"),
+            Self::AuthFailed(m) => write!(f, "AWS rejected the signed request: {m}"),
+            Self::Throttled(m) => write!(f, "AWS throttled or unavailable: {m}"),
+            Self::MissingSecretString => {
+                f.write_str("Secret value has no SecretString (likely stored as SecretBinary)")
+            }
+            Self::Other(m) => write!(f, "AWS error: {m}"),
         }
     }
 }
 impl std::error::Error for AwsSecretError {}
 
 impl From<pdk::hl::HttpClientError> for AwsSecretError {
-    fn from(e: pdk::hl::HttpClientError) -> Self { Self::HttpClient(format!("{e:?}")) }
+    fn from(e: pdk::hl::HttpClientError) -> Self {
+        Self::HttpClient(format!("{e:?}"))
+    }
 }
 impl From<serde_json::Error> for AwsSecretError {
-    fn from(_: serde_json::Error) -> Self { Self::JsonParse }
+    fn from(_: serde_json::Error) -> Self {
+        Self::JsonParse
+    }
 }
 impl From<pdk::hl::InvalidUri> for AwsSecretError {
-    fn from(_: pdk::hl::InvalidUri) -> Self { Self::HttpClient("invalid URI".into()) }
+    fn from(_: pdk::hl::InvalidUri) -> Self {
+        Self::HttpClient("invalid URI".into())
+    }
 }
 
 /// Map an AWS Secrets Manager error response into a typed `AwsSecretError`.
@@ -171,9 +183,8 @@ fn build_sigv4_strings(
 
     let payload_hash = sha256_hex(payload);
 
-    let canonical_request = format!(
-        "POST\n/\n\n{canonical_headers}\n\n{signed_headers}\n{payload_hash}"
-    );
+    let canonical_request =
+        format!("POST\n/\n\n{canonical_headers}\n\n{signed_headers}\n{payload_hash}");
 
     let credential_scope = format!("{date_stamp}/{region}/{SERVICE}/aws4_request");
 
@@ -206,7 +217,10 @@ pub async fn fetch_secret_string(
     // Build it via serde (issue #2) so a caller-supplied SecretId cannot
     // inject sibling fields such as `VersionStage` into the signed body.
     #[derive(serde::Serialize)]
-    struct GetSecretValueRequest<'a> { #[serde(rename = "SecretId")] secret_id: &'a str }
+    struct GetSecretValueRequest<'a> {
+        #[serde(rename = "SecretId")]
+        secret_id: &'a str,
+    }
     let payload = serde_json::to_vec(&GetSecretValueRequest { secret_id })
         .expect("GetSecretValueRequest is always serialisable");
 
@@ -227,24 +241,36 @@ pub async fn fetch_secret_string(
         .request(service)
         .path("/")
         .headers(vec![
-            ("Content-Type",  CONTENT_TYPE),
-            ("X-Amz-Date",    &amz_date),
-            ("X-Amz-Target",  TARGET_OP),
+            ("Content-Type", CONTENT_TYPE),
+            ("X-Amz-Date", &amz_date),
+            ("X-Amz-Target", TARGET_OP),
             ("Authorization", &auth_header),
         ])
         .body(&payload)
         .post()
         .await
         .map_err(|e| {
-            trace(ctx, Level::Error, &format!("Get secret from AWS - AWS call failed: {e:?}"));
+            trace(
+                ctx,
+                Level::Error,
+                &format!("Get secret from AWS - AWS call failed: {e:?}"),
+            );
             AwsSecretError::HttpClient(format!("{e:?}"))
         })?;
 
     let status = response.status_code();
-    trace(ctx, Level::Info, &format!("Get secret from AWS - HTTP {status}"));
+    trace(
+        ctx,
+        Level::Info,
+        &format!("Get secret from AWS - HTTP {status}"),
+    );
 
     let json: serde_json::Value = serde_json::from_slice(response.body()).map_err(|e| {
-        trace(ctx, Level::Error, &format!("Get secret from AWS - Failed to parse secret JSON: {e:?}"));
+        trace(
+            ctx,
+            Level::Error,
+            &format!("Get secret from AWS - Failed to parse secret JSON: {e:?}"),
+        );
         AwsSecretError::JsonParse
     })?;
 
@@ -253,7 +279,11 @@ pub async fn fetch_secret_string(
     // → 503, etc. (issue #15).
     if status != 200 {
         let err = classify_aws_error(status, &json);
-        trace(ctx, Level::Error, &format!("Get secret from AWS - error: {err}"));
+        trace(
+            ctx,
+            Level::Error,
+            &format!("Get secret from AWS - error: {err}"),
+        );
         return Err(err);
     }
 
@@ -383,7 +413,10 @@ mod tests {
             b"{}",
         );
         // Canonical request begins with POST\n/\n\n
-        assert!(canonical.starts_with("POST\n/\n\n"), "canonical starts wrong");
+        assert!(
+            canonical.starts_with("POST\n/\n\n"),
+            "canonical starts wrong"
+        );
         // Must contain each header line and the signed-headers list.
         assert!(canonical.contains("content-type:application/x-amz-json-1.1"));
         assert!(canonical.contains("host:secretsmanager.us-east-1.amazonaws.com"));

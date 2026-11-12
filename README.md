@@ -9,7 +9,7 @@ The AES key is **fetched at request time** from **AWS Secrets Manager**, cached 
 **Why:** Enterprises that terminate TLS at the gateway often still need the body to be at‑rest‑encrypted on the client side, on the upstream side, or both — for compliance (RBI, PCI‑DSS, HIPAA, DPDPA), for cross‑region transport, or when integrating with legacy systems that already speak AES. Doing this at the gateway keeps the client and backend simple: neither has to know the other is encrypting.
 
 **Policy name in Anypoint Exchange:** `API Encryption Decryption Policy`
-**Current version:** `1.0.2`
+**Current version:** `1.0.3`
 
 > ⚠️ **Before you can build OR publish:** this repo ships with a nil
 > placeholder Anypoint business-group UUID
@@ -66,27 +66,48 @@ The MAC covers every byte before it including the version byte, so an attacker c
 
 The original `Content-Type` is preserved in the `X-Content-Type` header so the other side can parse the plaintext after decrypting.
 
-**Safety rails (since 1.0.2):**
+**Safety rails (request leg, since 1.0.2; response leg fail-closed added 1.0.3):**
 
-| Guard | Behaviour |
-|---|---|
-| **Max body** | `768 KiB` per body. Larger bodies → HTTP `413 Payload Too Large`. |
-| **Content-Encoding** | Only `identity` is transformed. `gzip`, `br`, `deflate`, etc. → HTTP `415 Unsupported Media Type`. |
-| **Content-Type streaming** | `text/event-stream`, `application/grpc`, `application/grpc+proto` → HTTP `415`. |
-| **Source header** | ASCII alphanumeric + `.` `_` `-`, max 128 chars, non-empty → otherwise HTTP `400`. |
-| **Mode / TTL** | Unknown `requestMode`/`responseMode` or non-positive `cacheConfig.ttl` fails the policy at config load, not at request time. |
+The request and response legs have different fail-closed primitives because PDK's state machine commits response headers at a different point than request headers. Both legs now have a true fail-closed contract — on a transforming response leg (1.0.3+), the policy uses the `enable_stop_iteration` combined headers+body state so it can rewrite `:status` and `Content-Type` alongside the body.
+
+| Guard | Request leg | Response leg (transforming only) |
+|---|---|---|
+| **Max body** | `> 786,367` bytes of plaintext → HTTP `413` | `> 786,367` bytes of plaintext (encrypt) or `> 1,048,576` bytes of base64 (decrypt) → the policy rewrites status to `502 Bad Gateway` + JSON error body; upstream plaintext never reaches the client |
+| **Content-Encoding** | Non-`identity` → HTTP `415` | Non-`identity` → `502` fail-closed, upstream body replaced with JSON error |
+| **Content-Type streaming** | `text/event-stream`, `application/grpc*` → HTTP `415` | Same → `502` fail-closed |
+| **Range requests** | Transforming legs reject `Range:` with HTTP `416` | n/a (status gating skips 206) |
+| **MAC mismatch / bad envelope** | Decrypt leg: HTTP `400 Malformed ciphertext` | Decrypt leg: `502 Upstream ciphertext malformed or tampered` — upstream ciphertext never surfaces as plaintext |
+| **Source header** | ASCII alphanumeric + `.` `_` `-`, max 128 chars, non-empty → `400` | — |
+| **Mode / TTL** | Unknown `requestMode`/`responseMode` or non-positive `cacheConfig.ttl` fails the policy at config load, not at request time. | — |
 
 ### Error-to-HTTP-status table
 
+Request leg:
+
 | Condition                                    | Status | Body                                              |
 |----------------------------------------------|--------|---------------------------------------------------|
-| Missing / invalid `Source` header            | 400    | `{"error":"Missing or invalid  Source"}`         |
-| MAC mismatch / bad magic / wrong version     | 400    | `{"error":"Decryption failed"}`                   |
-| Secret not found in AWS Secrets Manager      | 400    | `{"error":"Missing or invalid  Source"}`         |
-| Body over `768 KiB`                          | 413    | `{"error":"Payload too large"}`                   |
-| `Content-Encoding != identity` / streaming CT | 415    | `{"error":"Unsupported media type"}`              |
-| AWS IAM / signing misconfiguration           | 500    | `{"error":"AWS Secrets Manager configuration error"}` |
-| AWS throttled or transient outage            | 503    | `{"error":"Secret backend temporarily unavailable"}` |
+| Missing / invalid `Source` header            | 400    | `{"errorMessage":"Missing or invalid  Source"}`  |
+| MAC mismatch / bad magic / wrong version     | 400    | `{"errorMessage":"Malformed ciphertext"}`        |
+| Secret not found in AWS Secrets Manager      | 400    | `{"errorMessage":"Missing or invalid  Source"}`  |
+| Plaintext over `786,367` bytes               | 413    | `{"errorMessage":"Request body exceeds policy maximum"}` |
+| `Content-Encoding != identity`               | 415    | `{"errorMessage":"Unsupported Content-Encoding"}` |
+| Streaming Content-Type                       | 415    | `{"errorMessage":"Unsupported streaming Content-Type"}` |
+| `Range:` present on a transforming leg       | 416    | `{"errorMessage":"Range requests not supported on transforming legs"}` |
+| AWS IAM / signing misconfiguration           | 500    | `{"errorMessage":"AWS Secrets Manager configuration error"}` |
+| AWS throttled or transient outage            | 503    | `{"errorMessage":"Secret backend temporarily unavailable"}` |
+
+Response leg (1.0.3+) — the policy rewrites the upstream response:
+
+| Condition                                              | Status | Body                                                             |
+|--------------------------------------------------------|--------|------------------------------------------------------------------|
+| Upstream response has `Content-Encoding != identity`   | 502    | `{"errorMessage":"Upstream response Content-Encoding not supported by policy"}` |
+| Upstream response is streaming                         | 502    | `{"errorMessage":"Upstream response Content-Type is streaming..."}`             |
+| Upstream response exceeds configured size              | 502    | `{"errorMessage":"Upstream response exceeds policy size limit"}`                |
+| Decrypt: upstream ciphertext tampered / malformed      | 502    | `{"errorMessage":"Upstream ciphertext malformed or tampered"}`                  |
+| Codec internal error on response                       | 502    | `{"errorMessage":"Policy codec error on response leg"}`                         |
+| `set_body` rejected after transform                    | 500    | `{"errorMessage":"Failed to write transformed response body"}`                  |
+
+All response-leg errors carry `Content-Type: application/json` and strip stale `ETag`/`Content-Length`/`Last-Modified`/`Content-Digest`/`Repr-Digest`/`Content-Range`/`X-Content-Type` so a client cannot match a conditional against a rewritten body.
 
 ## 3. Prerequisites
 
@@ -199,20 +220,35 @@ After `make release`, the policy appears in API Manager under **Custom** policie
 | `SuccessStatusCode` | string | no | Extra response status codes to encrypt on, comma‑separated. Appended to the always‑allowed `200,201,202,204` |
 | `SuccessStatusCodeDecrypt` | string | no | Same, for decrypt |
 | `awsAccessKey` | string | yes | AWS IAM access key ID with `secretsmanager:GetSecretValue` |
-| `awsAccessSecret` | string | yes | AWS IAM secret access key |
+| `awsAccessSecret` | string | yes | AWS IAM secret access key (marked `security:sensitive`; API Manager renders as password) |
 | `awsRegion` | string | yes | AWS region of the Secrets Manager endpoint, e.g. `ap-south-1` |
 | `awsService` | service URL | yes | Full URL of Secrets Manager, e.g. `https://secretsmanager.ap-south-1.amazonaws.com` |
+| `sourceBinding` | enum | no (default `principalMatch`) | **Since 1.0.3.** How the policy decides whether the caller is authorized to select a given `Source` value. See [Section 9.1 — Caller identity binding](#91-caller-identity-binding). |
 | `cacheConfig.ttl` | integer | yes | TTL in seconds for the per‑`Source` AES‑key cache. Default `86400` (24h) |
 
-Cache capacity is a hard‑coded 100 entries per Flex pod. The cache is in‑memory and shared across Envoy worker threads in the same pod; **not** shared across pods.
+Cache capacity is a hard‑coded 100 entries per Flex pod. The cache is in‑memory and shared across Envoy worker threads in the same pod; **not** shared across pods. **Since 1.0.3**, the cache namespace hashes `region + access_key + sha256(access_secret) + service_uri` so a rotation of the signing secret or a change to the Secrets Manager endpoint invalidates any warmed entries that the old credentials would otherwise still have reached.
+
+### 9.1 Caller identity binding
+
+> ⚠️ **What the policy does and does not authenticate.** The v2 envelope MAC proves that the body was produced by a holder of the AES key — nothing else. It does NOT authenticate HTTP headers, does NOT prevent replay, and does NOT substitute for transport-layer authentication. Treat the `Source` header as an untrusted claim until an earlier policy binds it to an authenticated identity.
+
+Two bindings are supported:
+
+- **`principalMatch`** (default, since 1.0.3). The policy reads the authenticated identity set by a prior auth policy (`Authentication::authentication()` → `client_id` or, as a fallback, `principal`) and rejects the request with HTTP 403 if the `Source` header does not exactly equal that identity. If no auth data is present at all the policy rejects with 403 — this mode requires an earlier auth policy in the chain. Comparison is byte-exact, no case folding.
+- **`headerTrust`**. The policy accepts the caller-supplied `Source` verbatim (the pre-1.0.3 behaviour). This is only safe when an earlier policy in the chain has already rewritten or verified `Source` against the authenticated principal. Choosing this value makes the operator responsible for that pairing.
+
+Migration: a 1.0.2 deployment that silently trusted the `Source` header must now either (a) chain a policy that rewrites `Source` from the authenticated principal before this one, OR (b) set `sourceBinding: headerTrust` to opt back into the old behaviour.
 
 ## 6. Request Headers
 
 | Header | When used | Required? | Purpose |
 |--------|-----------|-----------|---------|
-| `Source` | Always, for secret lookup | **Yes** | Keys the AES‑key lookup — `aeskeys/<Source>` in AWS Secrets Manager. Different `Source` values get different keys |
-| `X-Content-Type` | Non‑GET only | **Yes** | The real media type when the wire `Content-Type` is `application/octet-stream`. Checked before body processing on the request leg; set by the policy itself when it encrypts the response |
-| `Content-Type` | Always | Yes (standard HTTP) | Preserved into `X-Content-Type` when the policy flips the body to `application/octet-stream` on encrypt, restored from `X-Content-Type` on decrypt |
+| `Source` | Always, for secret lookup | **Yes** (unless `requestMode` AND `responseMode` are both `Plain`) | Keys the AES‑key lookup — `aeskeys/<Source>` in AWS Secrets Manager. Different `Source` values get different keys. **Since 1.0.3**: with `sourceBinding: principalMatch` (the default) the policy additionally requires that `Source` match the authenticated `client_id`/`principal`. See [Section 9.1](#91-caller-identity-binding) |
+| `X-Content-Type` | Non‑GET, request leg = `Decrypt` only | Yes in that case | The real plaintext media type. Required ONLY on a Decrypt request leg (since 1.0.3) — on an Encrypt request leg the policy now preserves the actual `Content-Type` automatically |
+| `Content-Type` | Always | Yes (standard HTTP) | Preserved into `X-Content-Type` when the policy encrypts a request/response, restored from `X-Content-Type` when it decrypts |
+| `Range` | Requests with a transforming leg | **Not supported** — HTTP 416 if present | Partial-body transforms would silently drop the range contract |
+
+**Plain request pass-through (since 1.0.3):** when `requestMode = Plain`, the request leg does NOT strip `Content-Type`, `Content-Length`, `ETag`, `Content-Digest`, `Repr-Digest`, `Content-Range`, or `Last-Modified`. The bytes the backend receives are byte-exact what the caller sent. The secret lookup still runs when `responseMode` transforms, so the response leg can decrypt or encrypt.
 
 GET requests skip body transformation entirely and don't require `X-Content-Type`.
 
@@ -234,16 +270,21 @@ GET requests skip body transformation entirely and don't require `X-Content-Type
 
 ### Request Phase
 
-1. Snapshot the watched headers (`Content-Type`, `Source`, `X-Content-Type`) into a lowercase map.
-2. **Non‑GET only:** require `X-Content-Type`. Reject with HTTP 400 if missing.
-3. **Resolve the AES key:**
+1. Snapshot the watched headers (`Content-Type`, `Source`, `X-Content-Type`) into a lowercase map — missing headers stay missing (no empty-string fabrication).
+2. **Non‑GET AND `requestMode ≠ Plain`:** only when the request leg actually transforms, enforce request-side preconditions:
+   - If `requestMode = Decrypt`: require `X-Content-Type` (plaintext media type for the decrypted body). Reject with HTTP 400 if missing.
+   - Reject `Content-Encoding` other than `identity` with HTTP 415.
+   - Reject streaming content types (`text/event-stream`, `application/grpc*`) with HTTP 415.
+   - Reject requests carrying a `Range` header with HTTP 416.
+3. **Resolve the AES key** (unless `requestMode = responseMode = Plain`, which short-circuits):
    - Look up `aeskeys/<Source>` in the in‑memory TTL cache.
    - On hit (and still within TTL), use it.
    - On miss or expiry, call AWS Secrets Manager with SigV4, store the result with a fresh timestamp.
 4. Build an AES‑256 codec from the base64‑encoded key (fails fast if the decoded key isn't exactly 32 bytes).
-5. **Non‑GET only, if `requestMode ≠ Plain`:** rewrite headers and transform the body:
-   - `Encrypt`: set `Content-Type: application/octet-stream`, preserve the original type in `X-Content-Type`, base64(IV ‖ ciphertext) the body.
-   - `Decrypt`: restore `Content-Type` from `X-Content-Type`, strip the `base64(IV ‖ ciphertext)` body back to plaintext.
+5. **Non‑GET AND `requestMode ≠ Plain`:** rewrite headers and transform the body:
+   - `Encrypt`: set `Content-Type: application/octet-stream`, preserve the original type in `X-Content-Type`, base64-v2-envelope the body.
+   - `Decrypt`: restore `Content-Type` from `X-Content-Type`, strip the v2 envelope back to plaintext.
+   - Representation-stale headers (`Content-Length`, `ETag`, `Content-Digest`, `Repr-Digest`, `Content-Range`, `Last-Modified`) are dropped on transforming legs only; a Plain request leg leaves them intact.
 6. Serialize the carry‑over state (secret, headers, response mode, parsed status‑code allow‑lists) and hand it to the response filter.
 
 ### Response Phase
@@ -414,9 +455,10 @@ curl -i -X POST "http://<flex-host>/your-endpoint" \
 | JSON request/response bodies | Yes | Full support |
 | Binary request/response bodies | Yes | v2 codec round-trips arbitrary bytes exactly; no UTF-8 coercion |
 | Multipart/form‑data | Partial | The whole body is encrypted/decrypted as a blob; multipart structure is not preserved across the hop |
-| Streaming responses (SSE, chunked) | No | Rejected with HTTP 415 — SSE/gRPC can't be buffered |
-| Compressed bodies (gzip/br/deflate) | No | Rejected with HTTP 415 — set `Content-Encoding: identity` upstream |
-| Body larger than 768 KiB | No | Rejected with HTTP 413 |
+| Streaming responses (SSE, chunked) | No | Request leg → HTTP 415; response leg → fail-closed 502 (upstream body never reaches the client as plaintext) |
+| Compressed bodies (gzip/br/deflate) | No | Request leg → HTTP 415; response leg → fail-closed 502. Set `Content-Encoding: identity` upstream |
+| Plaintext larger than 786,367 bytes | No | Request leg → HTTP 413; response leg → fail-closed 502. Limit anchors on the gateway's 1 MiB write buffer; the envelope size for the max plaintext is 1,048,560 bytes |
+| Partial / conditional responses (206, Range) | No | Request `Range:` on a transforming leg → HTTP 416; upstream 206 is outside the default status allow-list and passes through untransformed |
 | GET requests | Yes | Body transformation is skipped on GET; the response leg still runs |
 | WebSocket upgrades | No | PDK WebSocket support is separate; this policy only touches HTTP |
 
@@ -479,7 +521,7 @@ If you need temporary v1 interop (e.g. a slow client rollout), the clean path is
 | Implementation assetId | `api-encryption-decryption-policy-wasm` |
 | Flex `policyRef.name` | `api-encryption-decryption-policy-v1-0-impl` |
 | WASM binary | `api_encryption_decryption_policy.wasm` |
-| Current version | `1.0.2` |
+| Current version | `1.0.3` |
 
 > ⚠️ Before publishing to your own tenant, update `group_id` in
 > [Cargo.toml](Cargo.toml) (`[package.metadata.anypoint]`) from the shipped

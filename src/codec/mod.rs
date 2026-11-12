@@ -38,8 +38,8 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
-use crate::support::TraceCtx;
 use crate::support::log::{emit as trace, Level};
+use crate::support::TraceCtx;
 
 type Cbc256 = Cbc<Aes256, Pkcs7>;
 type HmacSha256 = Hmac<Sha256>;
@@ -47,11 +47,86 @@ type HmacSha256 = Hmac<Sha256>;
 const KEY_BYTES: usize = 32;
 const IV_BYTES: usize = 16;
 const MAC_BYTES: usize = 32;
+const BLOCK_BYTES: usize = 16;
 const MAGIC: [u8; 2] = [0x4B, 0x41]; // "KA"
 const VERSION_V2: u8 = 0x02;
 const HEADER_BYTES: usize = MAGIC.len() + 1 /* version */ + IV_BYTES;
 /// Minimum raw-envelope size: header + one ciphertext block + MAC.
-const MIN_ENVELOPE_BYTES: usize = HEADER_BYTES + 16 + MAC_BYTES;
+const MIN_ENVELOPE_BYTES: usize = HEADER_BYTES + BLOCK_BYTES + MAC_BYTES;
+
+// --- Size math (issue #19) -------------------------------------------------
+//
+// Reviewer verified: for n plaintext bytes the v2 wire output is
+//
+//     ciphertext_len = 16 * ((n / 16) + 1)           // PKCS#7 always pads
+//     raw_envelope   = 2 + 1 + 16 + ciphertext + 32  // magic+ver+iv+ct+mac
+//     b64_output     = 4 * ceil(raw_envelope / 3)
+//
+// We expose these as const-eval functions so the request/response filters
+// can compute caller-safe limits at compile time with no runtime cost.
+
+/// Base64-encoded wire size produced by `seal(plaintext of `plaintext_len`)`.
+/// Uses checked arithmetic so a pathological `plaintext_len` saturates to
+/// `usize::MAX` rather than wrapping — caller then compares against the
+/// buffer cap and rejects.
+///
+/// Exposed for tests and for any future caller that needs the forward
+/// direction; the runtime filter uses [`max_plaintext_for_output`]
+/// (inverse) at compile time via [`MAX_PLAINTEXT_BYTES`].
+#[allow(dead_code)]
+pub const fn wire_size_for_plaintext(plaintext_len: usize) -> usize {
+    // ciphertext = 16 * (plaintext_len / 16 + 1); PKCS#7 always adds ≥1 byte.
+    let blocks = plaintext_len / BLOCK_BYTES;
+    // blocks_plus_one = blocks + 1
+    let blocks_plus_one = match blocks.checked_add(1) {
+        Some(v) => v,
+        None => return usize::MAX,
+    };
+    let ct = match blocks_plus_one.checked_mul(BLOCK_BYTES) {
+        Some(v) => v,
+        None => return usize::MAX,
+    };
+    let raw = match ct.checked_add(HEADER_BYTES) {
+        Some(v) => v,
+        None => return usize::MAX,
+    };
+    let raw = match raw.checked_add(MAC_BYTES) {
+        Some(v) => v,
+        None => return usize::MAX,
+    };
+    // base64 output = 4 * ceil(raw / 3) = 4 * ((raw + 2) / 3)
+    let quot_plus = match raw.checked_add(2) {
+        Some(v) => v,
+        None => return usize::MAX,
+    };
+    match (quot_plus / 3).checked_mul(4) {
+        Some(v) => v,
+        None => usize::MAX,
+    }
+}
+
+/// Largest plaintext whose v2 wire output still fits within `output_cap`
+/// base64 bytes. Returns 0 if no single ciphertext block would fit.
+///
+/// Monotone in `plaintext_len`, so binary search is correct; we take the
+/// closed-form inverse of `wire_size_for_plaintext` instead.
+pub const fn max_plaintext_for_output(output_cap: usize) -> usize {
+    // From the forward formula:
+    //   b64 <= cap
+    //   4 * ceil(raw/3) <= cap
+    //   raw <= 3 * (cap / 4)
+    //   51 + 16*(n/16 + 1) <= 3 * (cap/4)
+    //   16*(n/16 + 1) <= 3*(cap/4) - 51
+    // Solve for n (strict floor on the division):
+    let cap_raw = (output_cap / 4) * 3;
+    if cap_raw < HEADER_BYTES + BLOCK_BYTES + MAC_BYTES {
+        return 0;
+    }
+    let max_ct = cap_raw - HEADER_BYTES - MAC_BYTES; // >= BLOCK_BYTES by the guard above
+    let max_blocks = max_ct / BLOCK_BYTES; // >= 1
+                                           // Largest n with (n/16 + 1) <= max_blocks → n <= (max_blocks-1)*16 + 15
+    (max_blocks - 1) * BLOCK_BYTES + (BLOCK_BYTES - 1)
+}
 
 /// Label for the HKDF step that derives the MAC key from the AES key.
 /// Changing this label breaks compatibility with existing envelopes, so
@@ -87,14 +162,19 @@ pub enum CodecError {
 impl fmt::Display for CodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::KeyLength             => f.write_str("Missing or Invalid AES Key"),
-            Self::EntropyFailed(e)      => write!(f, "IV entropy generation failed: {e}"),
-            Self::BadBase64             => f.write_str("Base64 decoding failed or envelope too short"),
-            Self::BadMagic              => f.write_str("Envelope does not start with v2 magic bytes"),
-            Self::UnsupportedVersion(v) => write!(f, "Unsupported envelope version 0x{v:02x} (only v2 is accepted)"),
-            Self::MacMismatch           => f.write_str("MAC verification failed — envelope is tampered or keys disagree"),
-            Self::CipherInit(e)         => write!(f, "Cipher creation failed: {e}"),
-            Self::Decrypt(e)            => write!(f, "AES decryption failed: {e}"),
+            Self::KeyLength => f.write_str("Missing or Invalid AES Key"),
+            Self::EntropyFailed(e) => write!(f, "IV entropy generation failed: {e}"),
+            Self::BadBase64 => f.write_str("Base64 decoding failed or envelope too short"),
+            Self::BadMagic => f.write_str("Envelope does not start with v2 magic bytes"),
+            Self::UnsupportedVersion(v) => write!(
+                f,
+                "Unsupported envelope version 0x{v:02x} (only v2 is accepted)"
+            ),
+            Self::MacMismatch => {
+                f.write_str("MAC verification failed — envelope is tampered or keys disagree")
+            }
+            Self::CipherInit(e) => write!(f, "Cipher creation failed: {e}"),
+            Self::Decrypt(e) => write!(f, "AES decryption failed: {e}"),
         }
     }
 }
@@ -144,12 +224,20 @@ impl Codec {
     pub fn seal(&self, plaintext: &[u8], ctx: &TraceCtx<'_>) -> Result<Vec<u8>, CodecError> {
         let mut iv = [0u8; IV_BYTES];
         if let Err(e) = getrandom::getrandom(&mut iv) {
-            trace(ctx, Level::Error, &format!("Encrypt Payload - IV entropy failed: {e}"));
+            trace(
+                ctx,
+                Level::Error,
+                &format!("Encrypt Payload - IV entropy failed: {e}"),
+            );
             return Err(CodecError::EntropyFailed(e.to_string()));
         }
 
         let cipher = self.cipher(&iv).map_err(|e| {
-            trace(ctx, Level::Error, &format!("Encrypt Payload - Cipher creation failed: {e}"));
+            trace(
+                ctx,
+                Level::Error,
+                &format!("Encrypt Payload - Cipher creation failed: {e}"),
+            );
             e
         })?;
         let ciphertext = cipher.encrypt_vec(plaintext);
@@ -179,7 +267,11 @@ impl Codec {
             .collect();
 
         let framed = B64.decode(&cleaned).map_err(|_| {
-            trace(ctx, Level::Error, "Decrypt Payload - Base64 decoding failed");
+            trace(
+                ctx,
+                Level::Error,
+                "Decrypt Payload - Base64 decoding failed",
+            );
             CodecError::BadBase64
         })?;
 
@@ -189,13 +281,19 @@ impl Codec {
 
         // Validate magic + version BEFORE touching the MAC.
         if framed[0..2] != MAGIC {
-            trace(ctx, Level::Error, "Decrypt Payload - Bad magic bytes (not a v2 envelope)");
+            trace(
+                ctx,
+                Level::Error,
+                "Decrypt Payload - Bad magic bytes (not a v2 envelope)",
+            );
             return Err(CodecError::BadMagic);
         }
         if framed[2] != VERSION_V2 {
-            trace(ctx, Level::Error, &format!(
-                "Decrypt Payload - Unsupported version 0x{:02x}", framed[2]
-            ));
+            trace(
+                ctx,
+                Level::Error,
+                &format!("Decrypt Payload - Unsupported version 0x{:02x}", framed[2]),
+            );
             return Err(CodecError::UnsupportedVersion(framed[2]));
         }
 
@@ -207,7 +305,11 @@ impl Codec {
         // ciphertext, to deny padding oracles on malformed ciphertext.
         let expected = self.mac(data);
         if expected.ct_eq(tag).unwrap_u8() != 1 {
-            trace(ctx, Level::Error, "Decrypt Payload - MAC verification failed");
+            trace(
+                ctx,
+                Level::Error,
+                "Decrypt Payload - MAC verification failed",
+            );
             return Err(CodecError::MacMismatch);
         }
 
@@ -215,11 +317,19 @@ impl Codec {
         let iv = &data[3..3 + IV_BYTES];
         let ciphertext = &data[HEADER_BYTES..];
         let cipher = self.cipher(iv).map_err(|e| {
-            trace(ctx, Level::Error, &format!("Decrypt Payload - Cipher creation failed: {e}"));
+            trace(
+                ctx,
+                Level::Error,
+                &format!("Decrypt Payload - Cipher creation failed: {e}"),
+            );
             e
         })?;
         cipher.decrypt_vec(ciphertext).map_err(|e| {
-            trace(ctx, Level::Error, &format!("Decrypt Payload - AES decryption failed: {e}"));
+            trace(
+                ctx,
+                Level::Error,
+                &format!("Decrypt Payload - AES decryption failed: {e}"),
+            );
             CodecError::Decrypt(e.to_string())
         })
     }
@@ -244,10 +354,9 @@ mod tests {
         // sha256("test-key") → 32 bytes → base64. Pre-computed so tests
         // don't need to call sha2 themselves.
         B64.encode([
-            0x9b, 0xa0, 0x44, 0xd2, 0xa0, 0x8f, 0x6b, 0x38,
-            0xe2, 0x56, 0x4a, 0xdd, 0xa6, 0x5c, 0x61, 0x6c,
-            0x24, 0x21, 0xab, 0x95, 0xf4, 0x23, 0x5a, 0x24,
-            0x11, 0xc8, 0xbf, 0x1d, 0xd5, 0x80, 0x75, 0x4a,
+            0x9b, 0xa0, 0x44, 0xd2, 0xa0, 0x8f, 0x6b, 0x38, 0xe2, 0x56, 0x4a, 0xdd, 0xa6, 0x5c,
+            0x61, 0x6c, 0x24, 0x21, 0xab, 0x95, 0xf4, 0x23, 0x5a, 0x24, 0x11, 0xc8, 0xbf, 0x1d,
+            0xd5, 0x80, 0x75, 0x4a,
         ])
     }
 
@@ -350,7 +459,10 @@ mod tests {
         // MAC) or MacMismatch depending on ordering — both are safe.
         let err = codec.open(tampered.as_bytes(), &ctx()).unwrap_err();
         assert!(
-            matches!(err, CodecError::UnsupportedVersion(_) | CodecError::MacMismatch),
+            matches!(
+                err,
+                CodecError::UnsupportedVersion(_) | CodecError::MacMismatch
+            ),
             "tampered version must be rejected, got {err:?}",
         );
     }
@@ -394,10 +506,7 @@ mod tests {
     fn whitespace_in_base64_tolerated() {
         let codec = codec();
         let envelope = codec.seal(b"hello", &ctx()).unwrap();
-        let wrapped: Vec<u8> = envelope
-            .chunks(20)
-            .collect::<Vec<_>>()
-            .join(&b'\n');
+        let wrapped: Vec<u8> = envelope.chunks(20).collect::<Vec<_>>().join(&b'\n');
         assert_eq!(codec.open(&wrapped, &ctx()).unwrap(), b"hello");
     }
 
@@ -438,6 +547,98 @@ mod tests {
         let envelope_a = codec_a.seal(b"secret", &ctx()).unwrap();
         let err = codec_b.open(&envelope_a, &ctx()).unwrap_err();
         assert!(matches!(err, CodecError::MacMismatch), "got {err:?}");
+    }
+
+    // ---- size math (issue #19) -------------------------------------------
+
+    /// Reviewer's canonical example: 768 KiB plaintext → 1,048,668-byte
+    /// base64 output. Our formula must match exactly.
+    #[test]
+    fn wire_size_matches_reviewer_table() {
+        // (plaintext_len, expected_b64_output) from the reviewer's math,
+        // independently re-computed in python during plan review.
+        for (n, expected) in [
+            // One padding block + header + MAC = 67 raw → 92 b64.
+            // (n=0..=15 all pack into exactly one PKCS#7 block.)
+            (0, 92),
+            (1, 92),
+            (15, 92),
+            (16, 112),            // crosses the one-block → two-block boundary
+            (786_367, 1_048_560), // last plaintext size that fits a 1 MiB cap
+            (786_368, 1_048_580), // first size that spills
+            (786_432, 1_048_668), // reviewer's 768 KiB example — 92 bytes over
+        ] {
+            assert_eq!(
+                wire_size_for_plaintext(n),
+                expected,
+                "wire_size_for_plaintext({n}) expected {expected}",
+            );
+        }
+    }
+
+    /// `wire_size_for_plaintext` is weakly monotone increasing: more bytes in,
+    /// never fewer bytes out. Guards against off-by-one regressions.
+    #[test]
+    fn wire_size_is_monotone() {
+        let mut prev = 0usize;
+        for n in [0, 1, 15, 16, 17, 31, 32, 1024, 65_535, 786_367, 786_368] {
+            let cur = wire_size_for_plaintext(n);
+            assert!(cur >= prev, "non-monotone at n={n}: prev={prev} cur={cur}");
+            prev = cur;
+        }
+    }
+
+    /// `max_plaintext_for_output` is the inverse of `wire_size_for_plaintext`:
+    /// the plaintext it returns must fit, and one more byte must not.
+    #[test]
+    fn max_plaintext_round_trips_against_forward_fn() {
+        for cap in [92, 100, 200, 1024, 65_536, 1_048_576] {
+            let max_n = max_plaintext_for_output(cap);
+            assert!(
+                wire_size_for_plaintext(max_n) <= cap,
+                "max_plaintext_for_output({cap}) = {max_n}, but wire_size = {}",
+                wire_size_for_plaintext(max_n),
+            );
+            // one byte more must overflow the cap
+            assert!(
+                wire_size_for_plaintext(max_n + 1) > cap,
+                "boundary wrong: cap={cap} max_n={max_n} wire(max_n+1) still fits",
+            );
+        }
+    }
+
+    /// Specific reviewer-named boundary: for a 1 MiB write cap, the largest
+    /// safe plaintext is 786,367 bytes — not the 786,432 (= 768 KiB) that
+    /// version 1.0.2 advertised.
+    #[test]
+    fn max_plaintext_for_1mib_is_786367() {
+        assert_eq!(max_plaintext_for_output(1_048_576), 786_367);
+    }
+
+    /// Round-trip at the limit must succeed end-to-end, including the
+    /// base64 expansion sizing we claim.
+    #[test]
+    fn round_trip_at_max_plaintext_for_1mib() {
+        let codec = codec();
+        let n = max_plaintext_for_output(1_048_576);
+        let plaintext = vec![0xC3u8; n];
+        let envelope = codec.seal(&plaintext, &ctx()).expect("seal ok");
+        assert!(
+            envelope.len() <= 1_048_576,
+            "envelope.len()={} exceeds 1 MiB cap",
+            envelope.len(),
+        );
+        let recovered = codec.open(&envelope, &ctx()).expect("open ok");
+        assert_eq!(recovered.len(), n);
+        assert_eq!(recovered, plaintext);
+    }
+
+    /// Checked arithmetic: a plaintext of `usize::MAX` saturates to usize::MAX
+    /// rather than wrapping. Guards the filter's size check from an attacker
+    /// supplying a body whose length overflows the formula.
+    #[test]
+    fn wire_size_saturates_on_overflow() {
+        assert_eq!(wire_size_for_plaintext(usize::MAX), usize::MAX);
     }
 
     /// Two seals of the same plaintext with the same key must differ (fresh

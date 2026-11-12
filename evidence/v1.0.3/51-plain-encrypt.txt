@@ -1,0 +1,16 @@
+HTTP/1.1 200 OK
+access-control-allow-credentials: true
+access-control-allow-origin: *
+access-control-expose-headers: Retry-After, RateLimit, RateLimit-Policy, WWW-Authenticate
+x-content-type-options: nosniff
+date: Thu, 12 Nov 2026 11:10:18 GMT
+x-content-type: application/json
+content-type: application/octet-stream
+server: Anypoint Flex Gateway
+x-envoy-decorator-operation: api-instance-21294366.edc1ebcc-bf80-423a-b46a-192b3fc86794.svc
+transfer-encoding: chunked
+x-correlation-id: 9fff7898-12e3-48bb-97f3-5da835ea2b1e
+Strict-Transport-Security: max-age=31536000; includeSubdomains
+Connection: Keep-Alive
+
+S0ECZILVPB0tIRV3G8gt4OctSSDN9z/FObXyDrTdGcmQmU5pRAko6+sBstzbvDfb1SA5LKpEYd1b4Bgrl6yXvv/v+opItiJu3YsUcRsHvbSd6ajMzc6Of6J+rZPIHCMzuyJXAy4l6/82hKcOd/vX3OgpnDGnluuDAKYZ6emBMl/+HWttki0eYiy5MeLLNQ9w8cqZfrSUaQylMSzNz5X/PjzZyOs/hHQy5kOvADesc/1XlwKgsBj5qKUFLtsZ7g1Wxt2S1XYevR/sanoJop/pU5jY/07ZEayJ9MyVu0P1pq/oqcIVI9z+4FRN2Hc1JUoOr3BgYPI/298/NxS8oIN7aVGvkYhEsj1UKXy6FYU/uZ0NlTuqGMW9z1VXV+CSXMxs0dGUg53iYd6gBLov/pTvWiWnK9DSpnDUzGnZZoRNQbTGGK7/oV2IqEsSnaAPwbyAHt/atKEjo6AQVBEfIN3ijU0PCaojcOX2B+FDjWEJerrnICOrw9X4zOb8y1boUhuL14DNNutdtzAZvIOnTO6IpjxaPRwhhjTZRlWHPFe2P/3EMIXLxkCD8fSDoVtUj/rg5TOoYiScPNtqippZN6ASwy79fIIED6HgkmEH9Yec5qCsKdJ6LmVo+1SlghhiuXuUi6hcuNLYzU20+m2gpTAvaqVX38JU+IGUAFus0GbJTUgfgaIH9SZPY2rzRMuq7Lul3f05wpTsaqF8GTD+7mqTXcBezTwpNfZDVmQIBc9NYw4mWqN+nLf8F30TBo+1ZMhmokJyH/crk58OOLpWjfMoGPhtG5CZqu5MdMdw6P9RHiYGJdTpuTas5yUz3wLi36d5eAT9dqzi5x1oa7WoBn6QEn/47v9Xqq/Q2R3dWObaAVq+TX1A1wYtQTIvQxyH2WyGjjq3+YgxZCuiN1y1KCvvPMb53XR+LkrfKCFhlSOou/BPBZKEcbzzMlBeH7um6dCc1fCo3/S0yVcdwHsi5hZiFwUGCg==

@@ -1,0 +1,11 @@
+HTTP/1.1 415 Unsupported Media Type
+content-type: application/json
+content-length: 67
+date: Thu, 12 Nov 2026 10:49:01 GMT
+server: Anypoint Flex Gateway
+x-envoy-decorator-operation: api-instance-21294366.edc1ebcc-bf80-423a-b46a-192b3fc86794.svc
+x-correlation-id: 4827b89f-77d1-4fea-8cb3-3d3c03a7f5ec
+Strict-Transport-Security: max-age=31536000; includeSubdomains
+Connection: Keep-Alive
+
+{"errorMessage":"Unsupported Content-Encoding","source":"partnerA"}

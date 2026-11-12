@@ -16,7 +16,10 @@ pub fn error_response(status: u32, message: &str, ctx: &TraceCtx<'_>) -> Flow<()
     .to_string();
 
     let response = Response::new(status)
-        .with_headers(vec![("content-type".to_string(), "application/json".to_string())])
+        .with_headers(vec![(
+            "content-type".to_string(),
+            "application/json".to_string(),
+        )])
         .with_body(body);
 
     Flow::Break(response)

@@ -72,6 +72,28 @@ spec:
        description: Full URL, e.g. https://secretsmanager.ap-south-1.amazonaws.com
        default: $AwsSecretManagerServiceUrl
 
+    # --- Caller identity → Source binding (issue #22) ------------------------
+    # `headerTrust`      — accept whatever `Source` header the caller sent
+    #                      (the previous behaviour, now opt-in). Only safe
+    #                      when an EARLIER policy in the chain has already
+    #                      mapped the authenticated principal into the
+    #                      Source header. The MAC on the v2 envelope does
+    #                      NOT authenticate HTTP headers or prevent replay
+    #                      — this policy relies entirely on the gateway's
+    #                      authentication policy for that.
+    # `principalMatch`   — require that the Source header exactly matches
+    #                      the authenticated client_id / principal
+    #                      populated by a prior auth policy. Reject
+    #                      HTTP 403 otherwise. **Default from 1.0.3.**
+    sourceBinding:
+       type: string
+       title: Caller identity binding
+       description: How the policy decides whether a caller may select a given Source. principalMatch (default) requires the Source header to match the authenticated client_id/principal; headerTrust accepts any syntactically valid Source.
+       enum:
+         - principalMatch
+         - headerTrust
+       default: principalMatch
+
     cacheConfig:
        type: object
        title: Cache Configuration

@@ -1,0 +1,11 @@
+HTTP/1.1 413 Payload Too Large
+content-type: application/json
+content-length: 74
+date: Thu, 12 Nov 2026 10:48:48 GMT
+server: Anypoint Flex Gateway
+x-envoy-decorator-operation: api-instance-21294366.edc1ebcc-bf80-423a-b46a-192b3fc86794.svc
+x-correlation-id: 2a3bc1b5-5438-4718-818d-7d26cb5f3f78
+Strict-Transport-Security: max-age=31536000; includeSubdomains
+Connection: Keep-Alive
+
+{"errorMessage":"Request body exceeds policy maximum","source":"partnerA"}
